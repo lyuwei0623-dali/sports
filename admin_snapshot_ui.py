@@ -12,12 +12,17 @@ from typing import Any, Mapping
 
 SAFE_FAILURE_MESSAGE = "快照建立或發布失敗，請確認資料連線與設定後重試。"
 SAFE_FAILURE_BY_CODE = {
+    "no_games": "所選台灣日期沒有 MLB 賽事。",
+    "schedule_connection_failed": "MLB 官方賽程連線或逾時失敗，請稍後再試。",
+    "schedule_auth_failed": "MLB 官方賽程存取被拒絕。",
+    "schedule_quota_failed": "MLB 官方賽程請求受到速率限制。",
+    "schedule_format_failed": "MLB 官方賽程回應格式不符。",
     "no_events": "當天沒有從 API-Football 或 ESPN 取得可用賽程。",
     "external_api_authentication_error": "Football 資料來源金鑰未設定、無效或額度受限；系統已嘗試 ESPN 備援。",
     "league_season_configuration_error": "Football 聯賽賽季設定不正確。",
     "no_usable_markets": "已取得賽程，但沒有取得可用盤口；完整賽程仍會保留並標示 PASS。",
     "external_api_error": "Football 外部資料來源暫時無法連線。",
-    "api_failed": "MLB 外部賽程或盤口資料暫時無法取得。",
+    "api_failed": "MLB 官方賽程暫時無法取得。",
     "processing_failed": "已取得資料，但推薦運算未能完成。",
     "storage_failed": "推薦運算完成，但快照未能儲存。",
 }

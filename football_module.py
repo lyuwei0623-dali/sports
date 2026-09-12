@@ -19,6 +19,9 @@ import math
 import os
 import re
 import sqlite3
+import csv
+import unicodedata
+from io import StringIO
 from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
@@ -179,19 +182,29 @@ class FootballModule:
         ClubElo or The Odds API.  It may safely be retried; event rows are
         replaced atomically per date.  Member UI must never call this method.
         """
+        self._source_diagnostics = {}
         target = date.fromisoformat(date_str)
         espn_index = self._fetch_espn_fixtures(target)
         api_events: list[dict[str, Any]] = []
         api_football_status = "not_configured"
+        if not self.config.api_football_key:
+            self._source_diagnostics["API-Football"] = "未設定金鑰，使用 ESPN 賽程"
         if self.config.api_football_key:
             try:
                 api_events = self._fetch_api_football_fixtures(target, season_by_league)
                 api_football_status = "ok" if api_events else "empty"
-            except Exception:
+            except Exception as exc:
+                self._source_diagnostics["API-Football"] = _provider_failure(exc)
                 # API-Football is enrichment.  A provider/key/quota problem must
                 # not erase an otherwise valid ESPN schedule.
                 api_football_status = "unavailable"
-        primary_events = api_events or self._espn_events_as_primary(espn_index)
+        primary_events = list(api_events)
+        seen = {(e["league_key"], _team_key(e["home"]), _team_key(e["away"])) for e in api_events}
+        for event in self._espn_events_as_primary(espn_index):
+            identity = (event["league_key"], _team_key(event["home"]), _team_key(event["away"]))
+            if identity not in seen:
+                primary_events.append(event)
+                seen.add(identity)
         elo = self._fetch_clubelo(target)
         odds = self._fetch_odds_consensus(target)
         stored = 0
@@ -209,16 +222,23 @@ class FootballModule:
                     event["home"], event["away"], json.dumps(event, ensure_ascii=False),
                     json.dumps(model, ensure_ascii=False),
                 ))
-                for q in _match_odds(odds, event):
+                matched = _match_odds(odds, event)
+                for q in matched:
                     conn.execute("""INSERT INTO football_market_reference VALUES(?,?,?,?,?,?,?,?,?,?)""", (
                         date_str, event["event_id"], q["market_type"], q["side"], q["line"],
                         q["price"], q["provider"], q["observed_at"], q["source_count"],
                         json.dumps(q, ensure_ascii=False),
                     ))
                 stored += 1
+            matched_count = conn.execute("SELECT COUNT(*) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
+            self._source_diagnostics["盤口匹配"] = f"來源 {len(odds)} 筆；成功對應賽事 {matched_count} 筆"
+            unmatched = sorted({name for e in primary_events for name in (e["home"], e["away"]) if _team_key(name) not in elo})
+            self._source_diagnostics["ClubElo 匹配"] = (
+                "來源未取得評分，尚無法進行匹配" if not elo else
+                f"未對應 {len(unmatched)} 隊：" + "、".join(unmatched))
             summary = {"api_football_events": len(api_events), "api_football_status": api_football_status,
                        "espn_events": len(espn_index), "primary_events": len(primary_events),
-                       "clubelo_teams": len(elo), "odds_quotes": len(odds)}
+                       "clubelo_teams": len(elo), "odds_quotes": len(odds), "diagnostics": dict(getattr(self, "_source_diagnostics", {}))}
             conn.execute("""INSERT INTO football_daily_runs VALUES(?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET fetched_at=excluded.fetched_at,
               status=excluded.status,source_summary=excluded.source_summary""",
@@ -299,7 +319,7 @@ class FootballModule:
     def _build_automatic_snapshot_payload(self, date_str: str, updated_at: str) -> tuple[list[dict[str, Any]], dict[str, Any], Optional[str]]:
         """Build a display payload from saved backend data and standard football markets."""
         with self._db() as conn:
-            events = conn.execute("SELECT event_id,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
+            events = conn.execute("SELECT event_id,league_key,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
             references = conn.execute("""SELECT event_id,market_type,side,line,price,observed_at
               FROM football_market_reference WHERE date_str=? ORDER BY event_id,observed_at""", (date_str,)).fetchall()
         if not events:
@@ -322,6 +342,7 @@ class FootballModule:
                     normalised = [_validate_market(market) for market in markets]
                     _validate_market_set(normalised)
                 except (TypeError, ValueError):
+                    normalised = []
                     market_warning = "自動盤口格式不完整，本場先保留賽程並標示 PASS"
             else:
                 market_warning = "尚未取得可用盤口，本場先保留賽程並標示 PASS"
@@ -329,7 +350,7 @@ class FootballModule:
             recommendations = self._calculate_recommendations(model, normalised) if normalised else []
             risk = model.get("risk", {})
             row = {
-                "event_id": event["event_id"], "sport": "football", "kickoff": event["kickoff"],
+                "event_id": event["event_id"], "league_key": event["league_key"], "forecast": _saved_forecast(model), "sport": "football", "kickoff": event["kickoff"],
                 "home": event["home_team"], "away": event["away_team"], "model": model,
                 "risk": _risk_display(risk), "risk_display": _risk_display(risk),
                 "warning": _join_warning("自動更新／尚未人工校正", market_warning, _risk_warning(risk)),
@@ -339,6 +360,7 @@ class FootballModule:
                 "latest_market": _markets_display(normalised, event["home_team"], event["away_team"])
                                  if normalised else "自動盤口未取得",
                 "market_change": "自動快照盤口（尚無人工校正歷程）",
+                "market_evaluations": recommendations,
                 "recommendations": [],
             }
             for recommendation in recommendations:
@@ -366,9 +388,19 @@ class FootballModule:
             if not season:
                 continue
             response = requests.get(f"{self.config.api_football_base}/fixtures", headers=headers,
-                params={"league": league_id, "season": season, "date": target.isoformat()}, timeout=12)
+                params={"league": league_id, "season": season, "date": target.isoformat(), "timezone": "Asia/Taipei"}, timeout=12)
             response.raise_for_status()
-            for item in response.json().get("response", []):
+            body = response.json()
+            if body.get("errors"):
+                errors = body["errors"]
+                codes = set(errors) if isinstance(errors, dict) else set()
+                reason = ("API-Football 額度或請求速率限制" if codes & {"rateLimit", "requests"} else
+                          "API-Football 方案、認證或賽季參數遭拒")
+                if not hasattr(self, "_source_diagnostics"):
+                    self._source_diagnostics = {}
+                self._source_diagnostics["API-Football " + league_key] = reason
+                continue
+            for item in body.get("response", []):
                 fixture = item.get("fixture", {})
                 teams = item.get("teams", {})
                 if not fixture.get("id") or not teams.get("home", {}).get("name"):
@@ -449,31 +481,45 @@ class FootballModule:
         for league_key in DEFAULT_LEAGUES:
             try:
                 url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_key}/scoreboard"
-                r = requests.get(url, params={"dates": target.strftime("%Y%m%d"), "limit": 100}, timeout=8)
+                r = requests.get(url, params={"dates": (target-timedelta(days=1)).strftime("%Y%m%d") + "-" + target.strftime("%Y%m%d"), "limit": 100}, timeout=8)
+                r.raise_for_status()
                 for event in r.json().get("events", []) if r.ok else []:
+                    if _local_date(event.get("date")) != target.isoformat():
+                        continue
                     comp = (event.get("competitions") or [{}])[0]
                     names = {c.get("homeAway"): c.get("team", {}).get("name", "") for c in comp.get("competitors", [])}
                     if names.get("home") and names.get("away"):
                         saved = dict(event)
                         saved["_league_key"] = league_key
                         out[(_team_key(names["home"]), _team_key(names["away"]))] = saved
-            except requests.RequestException:
+            except Exception as exc:
+                if not hasattr(self, "_source_diagnostics"):
+                    self._source_diagnostics = {}
+                self._source_diagnostics["ESPN " + league_key] = _provider_failure(exc)
                 continue
         return out
 
     def _fetch_clubelo(self, target: date) -> dict[str, float]:
+        # Do not request a future rating snapshot. Never label fallback ratings current.
+        rating_day = min(target, datetime.now(TZ_TAIPEI).date())
+        if not hasattr(self, "_source_diagnostics"):
+            self._source_diagnostics = {}
         try:
-            r = requests.get(f"https://api.clubelo.com/{target.isoformat()}", timeout=10)
+            r = requests.get(f"https://api.clubelo.com/{rating_day.isoformat()}", timeout=15)
             r.raise_for_status()
-            rows = r.text.splitlines()
-            headings = rows[0].split(",")
-            club_i, elo_i = headings.index("Club"), headings.index("Elo")
-            return {_team_key(line.split(",")[club_i]): float(line.split(",")[elo_i]) for line in rows[1:] if "," in line}
-        except (requests.RequestException, ValueError, IndexError):
+            records = list(csv.DictReader(StringIO(r.text.lstrip("\ufeff"))))
+            ratings = {_team_key(row["Club"]): float(row["Elo"]) for row in records}
+            self._source_diagnostics["ClubElo"] = f"評分日期 {rating_day}，取得 {len(ratings)} 隊"
+            return ratings
+        except Exception as exc:
+            self._source_diagnostics["ClubElo"] = _provider_failure(exc)
             return {}
 
     def _fetch_odds_consensus(self, target: date) -> list[dict[str, Any]]:
+        if not hasattr(self, "_source_diagnostics"):
+            self._source_diagnostics = {}
         if not self.config.odds_api_key:
+            self._source_diagnostics["The Odds API"] = "未設定金鑰"
             return []
         keys = {"eng.1": "soccer_epl", "esp.1": "soccer_spain_la_liga", "ger.1": "soccer_germany_bundesliga",
                 "ita.1": "soccer_italy_serie_a", "fra.1": "soccer_france_ligue_one", "uefa.champions": "soccer_uefa_champs_league"}
@@ -484,12 +530,17 @@ class FootballModule:
                     "apiKey": self.config.odds_api_key, "regions": self.config.odds_regions,
                     "markets": "h2h,spreads,totals", "oddsFormat": "decimal", "dateFormat": "iso"}, timeout=12)
                 r.raise_for_status()
-                for event in r.json():
+                events = r.json()
+                if not isinstance(events, list):
+                    raise ValueError("invalid response")
+                before = len(out)
+                for event in events:
                     if _local_date(event.get("commence_time")) != target.isoformat():
                         continue
                     out.extend(_consensus_event(league, event))
-            except requests.RequestException:
-                continue
+                self._source_diagnostics["盤口 " + league] = f"API 成功 {len(events)} 場；目標台灣日期 {len(out)-before} 筆盤口"
+            except Exception as exc:
+                self._source_diagnostics["盤口 " + league] = _provider_failure(exc)
         return out
 
     # -------------------------- Base Model: football only ---------------------
@@ -602,7 +653,10 @@ class FootballModule:
             conn.execute("UPDATE football_daily_runs SET status='published' WHERE date_str=?", (date_str,))
         # A published manual payload is immutable from the auto-snapshot path.
         # It is display persistence only; no model or market logic is changed.
-        payload = json.dumps({"rows": self.get_published_rows(date_str), "run_metadata": self.get_run_metadata(date_str)}, ensure_ascii=False)
+        published_rows = self.get_published_rows(date_str)
+        for row in published_rows:
+            row["forecast"] = _saved_forecast(row["model"])
+        payload = json.dumps({"rows": published_rows, "run_metadata": self.get_run_metadata(date_str)}, ensure_ascii=False)
         with self._db() as conn:
             conn.execute("""INSERT INTO football_manual_snapshots VALUES(?,?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET payload_json=excluded.payload_json,
@@ -637,7 +691,7 @@ class FootballModule:
     def get_published_rows(self, date_str: str) -> list[dict[str, Any]]:
         """Internal SQLite display reader; member routes must use get_member_snapshot."""
         with self._db() as conn:
-            rows = conn.execute("""SELECT e.event_id,e.kickoff,e.home_team,e.away_team,e.model_json,
+            rows = conn.execute("""SELECT e.event_id,e.league_key,e.kickoff,e.home_team,e.away_team,e.model_json,
               r.market_type,r.side,r.line,r.decimal_price,r.model_probability,r.ev,r.playable,r.label
               FROM football_events e LEFT JOIN football_recommendations r
               ON r.date_str=e.date_str AND r.event_id=e.event_id
@@ -663,15 +717,18 @@ class FootballModule:
                 first, latest = _first_and_latest_calibrations(history_by_event.get(key, []), current)
                 risk = model.get("risk", {})
                 record = grouped[key] = {
-                    "event_id": key, "sport": "football", "kickoff": row["kickoff"],
+                    "event_id": key, "league_key": row["league_key"], "forecast": model.get("display_forecast", {}), "sport": "football", "kickoff": row["kickoff"],
                     "home": row["home_team"], "away": row["away_team"], "model": model,
                     "risk": _risk_display(risk), "risk_display": _risk_display(risk),
                     "warning": _risk_warning(risk), "settlement_status": "pending",
                     "first_market": _markets_display(first, row["home_team"], row["away_team"]),
                     "latest_market": _markets_display(latest, row["home_team"], row["away_team"]),
                     "market_change": _market_change_display(first, latest, row["home_team"], row["away_team"]),
+                    "market_evaluations": [],
                     "recommendations": [],
                 }
+            if row["market_type"]:
+                record["market_evaluations"].append({k: row[k] for k in ("market_type", "side", "line", "decimal_price", "model_probability", "ev", "playable", "label")})
             if row["market_type"] and row["playable"]:
                 recommendation = {k: row[k] for k in ("market_type", "side", "line", "decimal_price", "model_probability", "ev", "playable", "label")}
                 recommendation["display"] = _market_selection_display(recommendation, row["home_team"], row["away_team"])
@@ -903,10 +960,12 @@ def _sources_display(summary: Mapping[str, Any]) -> str:
         ("odds_quotes", "The Odds API", "筆盤口"),
     )
     parts = [f"{label} {_number_display(summary[key])}{unit}" for key, label, unit in labels if key in summary]
+    parts.extend(f"{name}：{message}" for name, message in summary.get("diagnostics", {}).items())
     return "｜".join(parts) if parts else "尚未儲存資料來源摘要"
 
 def _team_key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    key = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode().casefold())
+    return _TEAM_ALIASES.get(key, key)
 
 def _local_date(value: Any) -> str:
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -986,12 +1045,12 @@ def _consensus_event(league: str, event: Mapping[str, Any]) -> list[dict[str, An
 def _match_odds(records: Iterable[Mapping[str, Any]], event: Mapping[str, Any]) -> list[dict[str, Any]]:
     # Kept outside the class for testability; match on league, two teams, kickoff within 30 min.
     target = datetime.fromisoformat(str(event["kickoff"]).replace("Z", "+00:00"))
-    target_teams = {_team_key(event["home"]), _team_key(event["away"])}
+    target_teams = (_team_key(event["home"]), _team_key(event["away"]))
     out=[]
     for row in records:
         try: delta=abs((target-datetime.fromisoformat(str(row["kickoff"]).replace("Z", "+00:00"))).total_seconds())
         except (ValueError, TypeError): continue
-        if row.get("league") == event.get("league_key") and target_teams == {_team_key(row.get("home")),_team_key(row.get("away"))} and delta <= 1800:
+        if row.get("league") == event.get("league_key") and target_teams == (_team_key(row.get("home")),_team_key(row.get("away"))) and delta <= 1800:
             out.append(dict(row))
     return out
 
@@ -1031,3 +1090,54 @@ def _validate_market_set(markets: list[Mapping[str, Any]]) -> None:
         raise ValueError("home and away handicap lines must be opposites")
     if ("total","over") in by and not np.isclose(by[("total","over")]["line"], by[("total","under")]["line"]):
         raise ValueError("over and under lines must match")
+
+
+_TEAM_ALIASES = {
+    "manchesterunited": "manunited", "manchestercity": "mancity",
+    "tottenhamhotspur": "tottenham", "newcastleunited": "newcastle",
+    "westhamunited": "westham", "wolverhamptonwanderers": "wolves",
+    "brightonhovealbion": "brighton", "nottinghamforest": "forest",
+    "bayernmunich": "bayern", "bayernmunchen": "bayern",
+    "borussiadortmund": "dortmund", "bayerleverkusen": "leverkusen",
+    "borussiamonchengladbach": "gladbach", "rbleipzig": "leipzig",
+    "internazionale": "inter", "intermilan": "inter", "acmilan": "milan",
+    "parissaintgermain": "psg", "atleticomadrid": "atletico",
+    "athleticclub": "bilbao", "athleticbilbao": "bilbao",
+    "celtavigo": "celta", "realbetis": "betis", "realsociedad": "sociedad",
+}
+
+def _provider_failure(exc):
+    try:
+        body = exc.response.json()
+        if body.get("error_code") == "OUT_OF_USAGE_CREDITS":
+            return "The Odds API 可用額度已用完"
+        if body.get("error_code") == "INVALID_KEY":
+            return "The Odds API 金鑰無效"
+    except (AttributeError, TypeError, ValueError):
+        pass
+    code = getattr(getattr(exc, "response", None), "status_code", None) or getattr(exc, "code", None)
+    if code in (401, 403): return "認證或存取權限失敗，請檢查金鑰與方案"
+    if code == 429: return "請求額度或速率限制，請檢查帳戶額度"
+    if code == 422: return "API 不接受查詢參數或市場，請檢查方案與市場設定"
+    if code: return f"來源 HTTP {int(code)} 錯誤"
+    if isinstance(exc, (ValueError, KeyError)): return "來源資料格式不符"
+    return "來源連線、逾時或 TLS 失敗"
+
+def _saved_forecast(model):
+    """Backend-only display projection of the existing independent Poisson model.
+
+    Does not feed recommendations, odds validation or the Base Model.
+    Members read the resulting numbers from snapshots, never call this function.
+    """
+    h, a = float(model["lambda_home"]), float(model["lambda_away"])
+    n = max(30, int(max(h, a) + 12 * math.sqrt(max(h, a)) + 10))
+    hp, ap = [math.exp(-h)], [math.exp(-a)]
+    for i in range(1, n):
+        hp.append(hp[-1] * h / i); ap.append(ap[-1] * a / i)
+    home = sum(hp[i] * sum(ap[:i]) for i in range(n))
+    draw = sum(hp[i]*ap[i] for i in range(n))
+    away = sum(ap[i] * sum(hp[:i]) for i in range(n))
+    total = home + draw + away
+    return {"home_probability": home/total, "draw_probability": draw/total,
+            "away_probability": away/total, "home_xg": h, "away_xg": a,
+            "score": f"{max(range(n), key=hp.__getitem__)}–{max(range(n), key=ap.__getitem__)}"}

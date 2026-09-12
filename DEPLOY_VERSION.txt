@@ -1,11 +1,3 @@
 維大力體育APP
-部署版本：2026-09-12-v5
-
-此資料夾內的全部 14 個檔案應直接放在 GitHub repository 根目錄。
-Streamlit 設定：branch = main，main file path = app.py。
-
-主要檔案辨識：
-- app.py：16207 bytes
-- football_module.py：62783 bytes
-- mlb_pre_release_module.py：68485 bytes
-- logo.png：397845 bytes
+2026-09-12-v7
+側欄必須顯示同一版本。

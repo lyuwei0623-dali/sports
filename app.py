@@ -22,6 +22,7 @@ from mlb_pre_release_module import (
 
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 APP_NAME = "維大力體育APP"
+APP_BUILD = "2026-09-12-v7"
 
 st.set_page_config(page_title=APP_NAME, page_icon="⚽", layout="wide")
 
@@ -84,9 +85,11 @@ def _member_page(app: AppServices) -> None:
     date_str = selected.isoformat()
     mlb_tab, football_tab = st.tabs(["⚾ MLB", "⚽ Football"])
     with mlb_tab:
+        st.button("查詢 MLB 已儲存推薦", key="query_mlb")
         gate = app.members.get_mlb_member_view(date_str, now=_taipei_now())
         st.markdown(render_member_view(gate), unsafe_allow_html=True)
     with football_tab:
+        st.button("查詢足球已儲存推薦", key="query_football")
         gate = app.members.get_football_member_view(date_str, now=_taipei_now())
         st.markdown(render_member_view(gate), unsafe_allow_html=True)
     st.caption("機率高不等於值得下注。")
@@ -285,6 +288,7 @@ def _admin_page(app: AppServices) -> None:
 
 def main() -> None:
     _render_sidebar_brand()
+    st.sidebar.caption("程式版本：" + APP_BUILD)
     role = st.session_state.get("user_role")
     if role not in {"member", "admin"}:
         _login()

@@ -718,15 +718,25 @@ def _with_stale_warning(payload: Mapping[str, Any], note: str) -> dict[str, Any]
 
 
 class HTTP:
-    def __init__(self, timeout: int = 12):
+    def __init__(self, timeout: int = 20):
         self.timeout = timeout
+        self._cache = {}
 
     def _read(self, url: str, params: Mapping[str, Any]) -> bytes:
         query = urlencode({k: v for k, v in params.items() if v is not None})
         request_url = f"{url}?{query}" if query else url
+        if request_url in self._cache:
+            return self._cache[request_url]
         request = Request(request_url, headers={"User-Agent": "MLB-pre-release-module/1.0"})
-        with urlopen(request, timeout=self.timeout) as response:  # nosec B310: fixed public data URLs
-            return response.read()
+        for attempt in range(2):
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    body = response.read()
+                    self._cache[request_url] = body
+                    return body
+            except Exception as exc:
+                if attempt or getattr(exc, "code", None) in (400, 401, 403, 404, 422, 429):
+                    raise
 
     def get_json(self, url: str, **params: Any) -> Mapping[str, Any]:
         data = json.loads(self._read(url, params).decode("utf-8"))
@@ -1092,7 +1102,12 @@ class MLBPreReleaseService:
         When omitted on a game's first calibration, latest is also its first
         market and the member display reports ``無變化``.
         """
-        savant_probables = self.savant.probable_names(release_day)
+        # Savant is a secondary cross-check. Its temporary unavailability must
+        # not discard an otherwise valid official MLB schedule.
+        try:
+            savant_probables = self.savant.probable_names(release_day)
+        except Exception:
+            savant_probables = set()
         output = []
         for game in self.mlb.games_for_taiwan_date(release_day):
             risk = self._risk(game, savant_probables)
@@ -1204,17 +1219,21 @@ class MLBAutoSnapshotRunner:
             games = self.service.mlb.games_for_taiwan_date(day)
         except Exception as exc:
             return self._failed_result(
-                date_str, "api_failed",
+                date_str, _mlb_source_failure(exc, "schedule"),
                 f"MLB 即時資料取得失敗：{_safe_admin_error(exc, odds_api_key)}", current)
         if not games:
             return self._failed_result(
                 date_str, "no_games", "當日無可用 MLB 賽事", current)
+        odds_warning: Optional[str] = None
         try:
             odds_markets = self.odds_client.fetch_mlb_markets(odds_api_key)
         except Exception as exc:
-            return self._failed_result(
-                date_str, "api_failed",
-                f"MLB 盤口資料取得失敗：{_safe_admin_error(exc, odds_api_key)}", current)
+            # The official schedule is still useful and must remain visible.
+            # Without a verified market the existing rules naturally produce
+            # PASS rows, so no odds, direction, EV, or recommendation is
+            # invented here.
+            odds_markets = []
+            odds_warning = "The Odds API：" + _mlb_failure_label(_mlb_source_failure(exc, "odds")) + "；保留 MLB 官方完整賽表並標示 PASS"
         try:
             decisions = {
                 game.event_id: decide_automatic_market(
@@ -1233,8 +1252,13 @@ class MLBAutoSnapshotRunner:
                 decision = decisions.get(published.game.event_id)
                 if decision is None:
                     decision = decide_automatic_market(published.game, None, current)
-                payloads.append(_automatic_member_payload(
-                    published, decision, previous_by_event.get(published.game.event_id), current))
+                payload = _automatic_member_payload(
+                    published, decision, previous_by_event.get(published.game.event_id), current)
+                if odds_warning:
+                    payload["warning"] = "｜".join(
+                        value for value in (str(payload.get("warning") or ""), odds_warning) if value
+                    )
+                payloads.append(payload)
             if not payloads:
                 return self._failed_result(
                     date_str, "no_games", "當日無可用 MLB 賽事", current)
@@ -1252,9 +1276,11 @@ class MLBAutoSnapshotRunner:
             return _admin_snapshot_result(
                 "storage_failed", current, 0, False,
                 f"快照儲存失敗：{_safe_admin_error(exc, odds_api_key)}")
-        return _admin_snapshot_result(
+        result = _admin_snapshot_result(
             "automatic_available", current,
             int(saved.get("game_count", len(payloads))), True, None)
+        result["diagnostic_message"] = odds_warning or "MLB 官方賽程與盤口查詢已完成；未匹配場次請查看賽表警語。"
+        return result
 
     def _failed_result(
         self,
@@ -1306,6 +1332,20 @@ def _safe_admin_error(exc: Exception, odds_api_key: str) -> str:
         message = message.replace(str(odds_api_key), "[REDACTED]")
     message = re.sub(r"(?i)(api(?:_|-)?key=)[^&\s]+", r"\1[REDACTED]", message)
     return message[:300]
+
+
+def _mlb_source_failure(exc, source):
+    code = getattr(exc, "code", None)
+    if code in (401, 403): return source + "_auth_failed"
+    if code == 429: return source + "_quota_failed"
+    if isinstance(exc, (ValueError, KeyError)): return source + "_format_failed"
+    return source + "_connection_failed"
+
+
+def _mlb_failure_label(code):
+    return {"auth_failed": "認證或權限失敗，請檢查金鑰與方案",
+            "quota_failed": "額度或速率受限，請檢查帳戶用量",
+            "format_failed": "回應格式不符"}.get(code.split("_", 1)[1], "連線、逾時或 TLS 失敗")
 
 
 def _match_odds_market(game: Game, markets: Iterable[OddsMarket]) -> Optional[OddsMarket]:

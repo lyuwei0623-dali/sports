@@ -12,6 +12,7 @@ from datetime import datetime, time
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
+from football_display import LEAGUES, team_name, translate_teams
 
 try:  # Supports both a consolidated app folder and package-style imports.
     from core_shared_ui import DisplayStatus, ReportColumn, ReportRow, SharedReport
@@ -87,20 +88,63 @@ def football_rows_to_shared_report(rows: Iterable[Any], run_metadata: Mapping[st
 
     report_rows = []
     for row in rows:
+        home, away = str(_value(row, "home", "")), str(_value(row, "away", ""))
+        forecast = _value(row, "forecast", {}) or {}
+        evaluations = _value(row, "market_evaluations", ()) or ()
         recommendations = _value(row, "recommendations", ()) or ()
         warning = _join_text(_text(_value(row, "risk", "")), _text(_value(row, "warning", "")))
         cells = {
-            "event_meta": _event_meta(_value(row, "kickoff", "未提供"), _value(row, "sport", "Football")),
-            "matchup": _matchup(_value(row, "away", "客隊未提供"), _value(row, "home", "主隊未提供")),
-            "market": _market_text(row),
+            "event_meta": _format_taipei_kickoff(_value(row, "kickoff", "未提供")),
+            "matchup": f"主：{team_name(home)}\n客：{team_name(away)}",
+            "market": translate_teams(_market_text(row), home, away),
             "recommendation": _recommendation_text(recommendations),
-            "model_ev": _model_ev_text(_value(row, "model", "資料未提供"), recommendations),
+            "model_ev": _forecast_probabilities(forecast),
+            "xg": f"主 {_number(forecast.get('home_xg'))}／客 {_number(forecast.get('away_xg'))}",
+            "score": str(forecast.get("score") or "尚未儲存，請重新建立快照"),
+            "moneyline": _football_pick(recommendations, "moneyline", home, away, evaluations),
+            "spread": _football_pick(recommendations, "spread", home, away, evaluations),
+            "total": _football_pick(recommendations, "total", home, away, evaluations),
             "risk_warning": warning or "無額外警語",
             "source_timing": _run_metadata_text(run_metadata),
             "settlement": _settlement_label(_value(row, "settlement_status", "pending")),
         }
-        report_rows.append(ReportRow(str(_value(row, "event_id", "unknown")), cells, _display_status(row)))
-    return SharedReport("Football｜正式推薦", "football", MEMBER_REPORT_COLUMNS, tuple(report_rows))
+        report_rows.append(ReportRow(str(_value(row, "event_id", "unknown")), cells, _display_status(row),
+                                    group=LEAGUES.get(_value(row, "league_key"), "聯賽未記錄（請重新建立快照）")))
+    columns = tuple(ReportColumn(k, label) for k, label in (
+        ("event_meta", "比賽時間（台灣）"), ("matchup", "對戰"),
+        ("market", "市場盤口"), ("model_ev", "主勝／和局／客勝機率"),
+        ("xg", "預估 xG（模型進球）"), ("score", "預估比分（主：客）"),
+        ("moneyline", "獨贏推薦／EV"), ("spread", "讓分推薦／EV"),
+        ("total", "大小分推薦／EV"), ("risk_warning", "資料風險／警語")))
+    return SharedReport("足球賽事分析", "football", columns, tuple(report_rows),
+                        summary=_run_metadata_text(run_metadata))
+
+
+def _number(value):
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _forecast_probabilities(forecast):
+    values = []
+    for key, label in (("home_probability", "主勝"), ("draw_probability", "和局"), ("away_probability", "客勝")):
+        value = forecast.get(key)
+        values.append(f"{label} {float(value):.1%}" if value is not None else f"{label} 尚未儲存")
+    return "\n".join(values)
+
+
+def _football_pick(recommendations, market_type, home, away, evaluations=()):
+    picks = [p for p in _eligible_recommendations(recommendations) if _value(p, "market_type") == market_type]
+    if not picks:
+        values = [float(_value(p, "ev")) for p in evaluations
+                  if _value(p, "market_type") == market_type and _value(p, "ev") is not None]
+        if values:
+            return f"PASS｜未達推薦門檻；最高 EV {max(values):+.1%}"
+        return "PASS｜無可用盤口或未達推薦門檻；EV —"
+    return "\n".join(translate_teams(str(_value(p, "display", _value(p, "selection", "推薦"))), home, away)
+                     + f"｜EV {float(_value(p, 'ev')):+.1%}" for p in picks)
 
 
 def member_release_gate(
@@ -150,7 +194,7 @@ def decorate_snapshot_report(
     provenance = _join_text(
         marker,
         "校正狀態：" + _text(calibration_state) if calibration_state else "",
-        "更新：" + _text(updated_at) if updated_at else "",
+        "更新：" + _format_taipei_kickoff(updated_at) if updated_at else "",
     )
     rows = []
     for row in report.rows:
@@ -158,8 +202,11 @@ def decorate_snapshot_report(
         cells["source_timing"] = _join_text(cells.get("source_timing", ""), provenance)
         if stale_warning:
             cells["risk_warning"] = _join_text(cells.get("risk_warning", ""), "時效警語：" + _text(stale_warning))
-        rows.append(ReportRow(row.event_id, cells, row.status, row.note))
-    return SharedReport(title, report.sport, report.columns, tuple(rows), report.empty_message)
+        rows.append(ReportRow(row.event_id, cells, row.status, row.note, row.group))
+    columns = tuple(c for c in report.columns if c.key != "source_timing")
+    summaries = list(dict.fromkeys(row.cells.get("source_timing", "") for row in rows))
+    return SharedReport(title, report.sport, columns, tuple(rows), report.empty_message,
+                        _join_text(report.summary, provenance) if report.summary else _join_text(*summaries))
 
 
 def _value(source: Any, key: str, default: Any = None) -> Any:
@@ -188,6 +235,21 @@ def _join_text(*values: str) -> str:
 
 def _event_meta(kickoff: Any, sport: Any) -> str:
     return f"{kickoff}\n{sport}"
+
+
+def _format_taipei_kickoff(value: Any) -> str:
+    """Format a stored ISO kickoff for display only; never alter event data."""
+
+    raw = _text(value)
+    if not raw or raw == "未提供":
+        return "時間未提供"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=TZ_TW)
+        return parsed.astimezone(TZ_TW).strftime("%m/%d %H:%M（台灣時間）")
+    except (TypeError, ValueError):
+        return raw
 
 
 def _matchup(away: Any, home: Any) -> str:
@@ -233,7 +295,7 @@ def _eligible_recommendations(recommendations: Any) -> list[Any]:
             positive_ev = float(ev) > 0
         except (TypeError, ValueError):
             positive_ev = False
-        if playable is True and positive_ev:
+        if (playable is True or type(playable) is int and playable == 1) and positive_ev:
             picks.append(pick)
     return picks
 
@@ -247,8 +309,9 @@ def _run_metadata_text(metadata: Mapping[str, Any]) -> str:
     return _join_text(
         "來源：" + _text(metadata.get("sources", "資料來源未提供")),
         "校正來源：" + _text(metadata.get("calibration_source", "未提供")),
-        "更新：" + _text(metadata.get("updated_at", "未提供")),
-        "發布狀態：" + _text(metadata.get("release_status", "未提供")),
+        "更新：" + _format_taipei_kickoff(metadata.get("updated_at", "未提供")),
+        "發布狀態：" + {"automatic_available": "自動快照可查詢", "published": "人工正式發布",
+                      "awaiting_manual_calibration": "等待人工校正"}.get(metadata.get("release_status"), "已讀取儲存快照"),
     )
 
 

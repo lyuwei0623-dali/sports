@@ -1,41 +1,23 @@
-# SPORTS QUANT V3
+# 維大力體育APP — 2026-09-12-v7
 
-這是取代舊版單體 `app.py` 的新版 APP。它只使用模組化的 Core、MLB、Football 與會員發布服務；舊資料表與舊發布頁不在此專案中。
+本 ZIP 根目錄的 16 個檔案全部覆蓋到目前 sports Repository 根目錄，再 Commit。
+不需要刪除 GitHub 或 Streamlit，不更改現有 Secrets。
+Streamlit 入口 app.py，Python 3.12，依賴 requirements.txt。
+側欄必須顯示 2026-09-12-v7。
 
-## 資料與責任邊界
+更新後由管理員重新按 MLB 與足球的自動快照按鈕。
+舊快照沒有新增聯賽、1X2、預估比分欄位；程式不會在會員端替舊快照運算。
+舊人工發布仍優先；若讀到舊人工版本，需重新人工校正並發布才更新正式內容。
 
-| 路徑 | 允許行為 |
-| --- | --- |
-| 會員頁 | 只讀 MLB／Football 已儲存快照；台灣 19:30 前由 Core 顯示封鎖訊息 |
-| 後台 | 自動快照、人工盤口校正、重新計算與發布 |
-| 後台「自動存取快照」按鈕 | 管理員手動抓取、運算並保存自動快照 |
+足球以英超、法甲、德甲、西甲、義甲、歐冠分組。繁中名稱為展示對照，未知新隊名保留來源名稱，避免認錯隊伍。
+主客 xG 是既有 Poisson 模型的預估進球率；比分是該模型最可能的單一比分，並非保證比分或另一套模型。
+1X2 機率在後台建立快照時由既有 Poisson 分布生成展示摘要；EV 與推薦仍使用原本運算結果。
+來源、校正時間集中在表格上方。未達門檻顯示 PASS 和已計算的 EV；沒有盤口時不杜撰 EV。
 
-人工發布永遠優先於自動快照。MLB 的自動快照是 The Odds API 基準盤，並不冒充已人工 SUPER 校正；Football 使用既有標準亞洲盤計算。
+已驗證：Python 語法、21項模組測試、12個既有領域函式內容一致、MLB官方賽程15場。
+未驗證：使用者 Streamlit 環境的完整瀏覽器操作、真實私有 API 金鑰、The Odds API 可用盤口、ClubElo 連線恢复。
+本機無 Streamlit 安裝，不能把模組測試當作線上整個 APP 已通過。
 
-## 首次啟動
-
-1. 將 `.env.example` 複製成 `.env`，填入密碼與 API Key。`.env` 不可提交至 GitHub。
-2. 安裝：`pip install -r requirements.txt`
-3. 啟動：`streamlit run app.py`
-
-Docker 方式：`docker compose up -d --build`。
-
-## 快照建立方式
-
-目前 Streamlit 部署採管理員手動方式：登入管理員後台後，按 MLB 或 Football 的「立即執行自動快照」。成功保存後，會員端立即讀取該份保存的快照；會員端本身絕不抓取或重新運算資料。
-
-## 手動盤口上傳格式
-
-MLB：
-
-```json
-{"12345":[{"market_type":"spread","side":"home","raw_line":"-1+65","price":0.94}]}
-```
-
-Football：
-
-```json
-{"98765":[{"market_type":"spread","side":"home","line":-0.75,"decimal_price":1.94}]}
-```
-
-Football 的人工發布需涵蓋該日期所有已保存賽事，這是 Football 模組的既有完整校正門檻。
+ClubElo 本環境 HTTP/HTTPS 皆逾時。新版修正未來評分日期、CSV讀取及常見別名，外部服務仍可能無法連線。
+MLB本次官方賽程回應14.2秒，舊版12秒逾時可能不足；新版20秒及一次有限重試，不能據此認定部署端唯一根因。
+資料仍保存本地SQLite；本版沒有增加雲端持久資料庫或背景排程。
