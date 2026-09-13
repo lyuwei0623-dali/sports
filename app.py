@@ -6,7 +6,6 @@ calculate and save snapshots.  Sport calculation rules remain in their modules.
 from __future__ import annotations
 
 import os
-from base64 import b64encode
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,25 +36,25 @@ def _taipei_now() -> datetime:
 
 
 def _render_brand() -> None:
+    """Render the owner brand with Streamlit widgets, never embedded HTML.
+
+    Some hosted Streamlit builds deliberately render data-URI HTML as text.
+    Keeping the logo as a normal local image avoids exposing Base64 source code
+    while retaining the owner's anti-counterfeit mark on every entry page.
+    """
+
     logo = Path(__file__).with_name("logo.png")
-    logo_src = ""
-    if logo.exists():
-        logo_src = "data:image/png;base64," + b64encode(logo.read_bytes()).decode("ascii")
-    image = f'<img class="dali-brand__logo" src="{logo_src}" alt="大力體育防偽 LOGO">' if logo_src else ""
-    watermark = f"background-image:url('{logo_src}');" if logo_src else ""
-    st.markdown(f"""<style>
-      .block-container {{padding-top:1.25rem;max-width:1500px;}}
-      [data-testid="stSidebar"] {{display:none;}}
-      .dali-brand {{display:flex;align-items:center;gap:13px;background:linear-gradient(100deg,#0b1220,#1e293b);border:1px solid #334155;padding:10px 15px;border-radius:12px;margin:0 0 14px;box-shadow:0 4px 13px rgba(15,23,42,.16);}}
-      .dali-brand__logo {{width:68px;height:68px;object-fit:contain;background:#fff;border-radius:50%;border:2px solid #fbbf24;box-shadow:0 2px 7px rgba(251,191,36,.35);}}
-      .dali-brand__title {{color:#f8fafc;font-size:20px;font-weight:850;letter-spacing:.3px;line-height:1.18;}}
-      .dali-brand__sub {{color:#cbd5e1;font-size:12px;margin-top:3px;}}
-      .dali-brand__mark {{margin-left:auto;color:#fbbf24;font-size:12px;font-weight:800;white-space:nowrap;}}
-      .dali-watermark {{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.027;background-position:center 55%;background-repeat:no-repeat;background-size:300px;{watermark}}}
-      @media(max-width:700px){{.block-container{{padding:1rem .7rem;}}.dali-brand__logo{{width:54px;height:54px;}}.dali-brand__title{{font-size:17px;}}.dali-brand__mark{{display:none;}}}}
-    </style>
-    <div class="dali-watermark"></div>
-    <div class="dali-brand">{image}<div><div class="dali-brand__title">維大力體育APP</div><div class="dali-brand__sub">有依據的賽事分析・盤口價值・單場風險</div></div><div class="dali-brand__mark">官方會員分析</div></div>""", unsafe_allow_html=True)
+    logo_column, title_column = st.columns((1, 7), vertical_alignment="center")
+    with logo_column:
+        if logo.is_file():
+            st.image(str(logo), width=88)
+        else:
+            st.caption("大力體育")
+    with title_column:
+        st.title(APP_NAME)
+        st.caption("有依據的賽事分析・盤口價值・單場風險")
+        st.caption("大力體育防偽識別｜官方會員分析")
+    st.divider()
 
 
 def _login() -> None:

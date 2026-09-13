@@ -46,6 +46,26 @@ AUTO_ODDS_MAX_AGE = timedelta(hours=3)
 AUTO_MONEYLINE_MIN_PROBABILITY_GAP = .03
 DEFAULT_RELEASE_DB_PATH = os.environ.get("MLB_RELEASE_DB_PATH", "mlb_release.sqlite3")
 
+# The official MLB schedule and a bookmaker feed occasionally use different
+# but unambiguous abbreviations. These keys are used *only* to join the two
+# source records; they neither alter a team, a line, the model nor settlement.
+MLB_TEAM_KEY_ALIASES = {
+    "laangels": "losangelesangels",
+    "ladodgers": "losangelesdodgers",
+    "nymets": "newyorkmets",
+    "nyyankees": "newyorkyankees",
+    "kcroyals": "kansascityroyals",
+    "sfgiants": "sanfranciscogiants",
+    "sdpadres": "sandiegopadres",
+    "tbrays": "tampabayrays",
+    "wshnationals": "washingtonnationals",
+    "azdiamondbacks": "arizonadiamondbacks",
+    "cleguardians": "clevelandguardians",
+    "cinreds": "cincinnatireds",
+    "milbrewers": "milwaukeebrewers",
+    "oaklandathletics": "athletics",
+}
+
 
 class RiskLevel(str, Enum):
     GREEN = "綠燈"
@@ -813,11 +833,18 @@ def _parse_odds_event(event: Any) -> Optional[OddsMarket]:
             except (KeyError, TypeError, ValueError):
                 continue
             name = str(outcome.get("name") or "")
-            if key == "h2h" and name in {home, away}:
-                moneyline[name] = price
-            elif key == "spreads" and name in {home, away}:
+            if key == "h2h" and _same_mlb_team(name, home):
+                moneyline[home] = price
+            elif key == "h2h" and _same_mlb_team(name, away):
+                moneyline[away] = price
+            elif key == "spreads" and _same_mlb_team(name, home):
                 try:
-                    spreads[name] = (float(outcome["point"]), price)
+                    spreads[home] = (float(outcome["point"]), price)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            elif key == "spreads" and _same_mlb_team(name, away):
+                try:
+                    spreads[away] = (float(outcome["point"]), price)
                 except (KeyError, TypeError, ValueError):
                     continue
             elif key == "totals" and name in {"Over", "Under"}:
@@ -1371,13 +1398,47 @@ def _mlb_failure_label(code):
 
 
 def _match_odds_market(game: Game, markets: Iterable[OddsMarket]) -> Optional[OddsMarket]:
+    """Match a live market to the official schedule without changing odds.
+
+    Returning a copy keyed by the official home/away names is important: the
+    next calculation step uses those names to choose the correct side. An
+    abbreviation such as ``LA Dodgers`` must not make a real price look like a
+    missing price or, worse, attach it to the opposite team.
+    """
+
     candidates = [market for market in markets
-                  if normalize_name(market.home_team) == normalize_name(game.home)
-                  and normalize_name(market.away_team) == normalize_name(game.away)]
+                  if _same_mlb_team(market.home_team, game.home)
+                  and _same_mlb_team(market.away_team, game.away)]
     if not candidates:
         return None
     kickoff = parse_iso(game.kickoff)
-    return min(candidates, key=lambda market: abs(parse_iso(market.commence_time) - kickoff))
+    selected = min(candidates, key=lambda market: abs(parse_iso(market.commence_time) - kickoff))
+    return _rebase_market_to_official_game(selected, game)
+
+
+def _rebase_market_to_official_game(market: OddsMarket, game: Game) -> OddsMarket:
+    """Copy an already-validated market under the official schedule labels."""
+
+    def team_values(values: Mapping[str, Any]) -> dict[str, Any]:
+        rebased: dict[str, Any] = {}
+        for team, value in values.items():
+            if _same_mlb_team(team, market.home_team):
+                rebased[game.home] = value
+            elif _same_mlb_team(team, market.away_team):
+                rebased[game.away] = value
+        return rebased
+
+    return OddsMarket(
+        game.home,
+        game.away,
+        market.commence_time,
+        market.bookmaker,
+        market.updated_at,
+        team_values(market.moneyline),
+        team_values(market.spreads),
+        dict(market.totals),
+        dict(market.market_updated_at),
+    )
 
 
 def _automatic_quotes(decision: AutoMarketDecision) -> tuple[SuperQuote, ...]:
@@ -1436,17 +1497,47 @@ def _automatic_member_payload(
 
 
 def _automatic_market_display(game: Game, decision: AutoMarketDecision) -> str:
-    parts = []
-    if decision.favored_team and decision.underdog_team:
+    """Show only verified current prices used by the automatic calculation."""
+
+    def decimal(value: float) -> str:
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+
+    parts: list[str] = []
+    if (decision.favored_team and decision.underdog_team and decision.favorite_side
+            and decision.spread_prices):
+        favorite_price = decision.spread_prices.get(decision.favorite_side)
+        underdog_side = "away" if decision.favorite_side == "home" else "home"
+        underdog_price = decision.spread_prices.get(underdog_side)
+        if favorite_price and underdog_price:
+            parts.append(
+                f"The Odds API 讓分：{decision.favored_team} -1.5 @{decimal(favorite_price)}／"
+                f"{decision.underdog_team} +1.5 @{decimal(underdog_price)}")
+    elif decision.favored_team:
         parts.append(
-            f"自動基準盤：{decision.favored_team} -1.5／{decision.underdog_team} +1.5")
+            f"The Odds API 已辨識讓分隊：{decision.favored_team}；"
+            "未取得可驗證的 -1.5／+1.5 價格，未生成讓分推薦")
     else:
-        parts.append("讓分方向待人工校正")
+        parts.append("The Odds API 未取得可驗證讓分方向，未生成讓分推薦")
+
+    home_moneyline = decision.moneyline_prices.get("home")
+    away_moneyline = decision.moneyline_prices.get("away")
+    if home_moneyline and away_moneyline:
+        parts.append(
+            f"The Odds API 獨贏：{game.home} @{decimal(home_moneyline)}／"
+            f"{game.away} @{decimal(away_moneyline)}")
     if decision.total_line is not None:
+        over_price = decision.total_prices.get("over")
+        under_price = decision.total_prices.get("under")
+        total_prices = (
+            f" 大 @{decimal(over_price)}／小 @{decimal(under_price)}"
+            if over_price and under_price else ""
+        )
         parts.append(
-            f"The Odds API 大小 {decision.total_line:g}（{decision.odds_updated_at}）")
+            f"The Odds API 大小 {decision.total_line:g}{total_prices}")
     else:
-        parts.append("The Odds API 大小分中心盤未提供")
+        parts.append("The Odds API 未取得可驗證大小分中心盤，未生成大小分推薦")
+    if decision.odds_updated_at:
+        parts.append(f"市場更新：{_format_odds_update_time(decision.odds_updated_at)}")
     return "；".join(parts)
 
 
@@ -1580,6 +1671,26 @@ def innings_to_float(value: Any) -> float:
 
 def normalize_name(value: Any) -> str:
     return re.sub(r"[^a-z]", "", str(value).lower())
+
+
+def mlb_team_key(value: Any) -> str:
+    """Return a source-join key; this is not a model or betting transform."""
+
+    key = normalize_name(value)
+    return MLB_TEAM_KEY_ALIASES.get(key, key)
+
+
+def _same_mlb_team(left: Any, right: Any) -> bool:
+    return bool(mlb_team_key(left)) and mlb_team_key(left) == mlb_team_key(right)
+
+
+def _format_odds_update_time(value: Any) -> str:
+    """Presentation-only Taiwan timestamp for the saved market snapshot."""
+
+    try:
+        return parse_iso(str(value)).astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M（台灣時間）")
+    except (TypeError, ValueError):
+        return "時間未提供"
 
 
 def stable_seed(*parts: Any) -> int:
