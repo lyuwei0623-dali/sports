@@ -32,6 +32,7 @@ def show_report(st: Any, gate: Any, *, admin: bool = False) -> None:
     )
     st.caption(_source_caption(report.summary))
 
+    st.caption("賽果預估＝比賽結果；推薦欄機率＝該投注項目的模型估計。EV＝按所示賠率與結算規則估計的報酬率，不保證獲利。")
     compact = _compact_report(report)
     st.markdown(render_shared_report(compact), unsafe_allow_html=True)
     _render_single_game_detail(st, report, admin=admin)
@@ -47,6 +48,7 @@ def _compact_report(report: SharedReport) -> SharedReport:
             ReportColumn("matchup", "對戰", "primary", "16%"),
             ReportColumn("xg", "預估 xG", "normal", "11%"),
             ReportColumn("score", "預估比分", "normal", "9%"),
+            ReportColumn("model_ev", "主勝／和局／客勝", "normal"),
             ReportColumn("moneyline", "獨贏推薦／EV", "primary", "18%"),
             ReportColumn("spread", "讓分推薦／EV", "primary", "18%"),
             ReportColumn("total", "大小推薦／EV", "primary", "18%"),
@@ -57,7 +59,7 @@ def _compact_report(report: SharedReport) -> SharedReport:
             ReportColumn("event_meta", "開賽（台灣）", "primary", "12%"),
             ReportColumn("matchup", "對戰", "primary", "18%"),
             ReportColumn("pitchers", "先發投手", "normal", "20%"),
-            ReportColumn("model_ev", "模型估計", "normal", "20%"),
+            ReportColumn("model_ev", "賽果預估（非投注機率）", "normal", "20%"),
             ReportColumn("recommendation", "推薦盤口／EV", "primary", "30%"),
         )
         title = "MLB｜當日賽事分析"
@@ -76,7 +78,7 @@ def _compact_report(report: SharedReport) -> SharedReport:
 def _render_single_game_detail(st: Any, report: SharedReport, *, admin: bool) -> None:
     """Put explainability below the table rather than inside every table cell."""
 
-    st.markdown("#### 單場分析與推薦依據")
+    st.markdown("#### 單場盤口與水位變化")
     ids = list(range(len(report.rows)))
     index = st.selectbox(
         "選擇比賽",
@@ -85,20 +87,9 @@ def _render_single_game_detail(st: Any, report: SharedReport, *, admin: bool) ->
         key=f"detail:{report.sport}:{'admin' if admin else 'member'}",
     )
     row = report.rows[index]
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**保存盤口與價格**")
-        st.write(row.cells.get("market", "尚未取得可驗證盤口"))
-    with right:
-        st.markdown("**模型估計**")
-        st.write(row.cells.get("model_ev", "尚無可驗證模型估計"))
-
-    st.markdown("**推薦結論**")
-    if report.sport == "football":
-        for key, label in (("moneyline", "獨贏"), ("spread", "讓分"), ("total", "大小")):
-            st.write(f"{label}：{row.cells.get(key, '尚未保存')}")
-    else:
-        st.write(row.cells.get("recommendation", "尚未保存"))
+    change = str(row.cells.get("market_change", "尚無比較紀錄"))
+    st.write("盤口與水位未變動" if change == "無變化" else change)
+    st.caption("比較首次保存與最新保存的盤口；不是莊家完整開盤歷史。查詢只讀快照，不會抓取即時水位。")
 
     with st.expander("資料限制、風險與適用條件", expanded=False):
         st.write(row.cells.get("risk_warning", "無額外紀錄"))

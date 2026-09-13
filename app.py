@@ -19,6 +19,8 @@ from member_experience import show_report
 from live_ui import render_live
 from source_health import check_sources
 from football_display import team_name
+from member_links import render_member_link, resolve_login_role
+from manual_odds import hk_to_decimal
 from mlb_pre_release_module import (
     MLBAutoSnapshotRunner, MLBPreReleaseService, SuperQuote, parse_super_line,
 )
@@ -69,10 +71,11 @@ def _login() -> None:
         st.stop()
     password = st.text_input("登入密碼", type="password", key="login_password")
     if st.button("登入", type="primary"):
-        if password == admin_password:
+        role = resolve_login_role(password, member_password, admin_password, st.query_params.get("view") == "member")
+        if role == "admin":
             st.session_state.user_role = "admin"
             st.rerun()
-        elif password == member_password:
+        elif role == "member":
             st.session_state.user_role = "member"
             st.rerun()
         else:
@@ -241,7 +244,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
     snapshot = app.football.get_member_snapshot(date_str)
     rows = list(snapshot.get("rows") or [])
     st.subheader("足球人工校正與發布")
-    st.caption("逐場輸入標準亞洲盤與十進位賠率；儲存完成後再發布。")
+    st.caption("逐場輸入標準亞洲盤與不含本金水位（0.94 會轉成歐洲賠率 1.94）；儲存完成後再發布。")
     if not rows:
         st.info("請先執行足球自動快照，取得當天完整賽程後再人工校正。")
         return
@@ -258,28 +261,28 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
             "主隊亞洲讓分（- 主讓；+ 主受讓）", value="-0.5",
             help="只需填主隊一格。支援 -0.5、+0.5、-0/0.5、+0.5/1；客隊盤會自動反向。",
         )
-        home_spread = spread_2.number_input("主隊讓分盤十進位賠率", min_value=1.01, value=1.94, step=0.01)
-        away_spread = spread_3.number_input("客隊讓分盤十進位賠率", min_value=1.01, value=1.94, step=0.01)
+        home_spread = spread_2.number_input("主隊讓分盤水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
+        away_spread = spread_3.number_input("客隊讓分盤水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         total_1, total_2, total_3 = st.columns(3)
         total_line = total_1.number_input("大小分盤", min_value=0.0, value=2.5, step=0.25)
-        over_price = total_2.number_input("大分十進位賠率", min_value=1.01, value=1.94, step=0.01)
-        under_price = total_3.number_input("小分十進位賠率", min_value=1.01, value=1.94, step=0.01)
+        over_price = total_2.number_input("大分水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
+        under_price = total_3.number_input("小分水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         money_1, money_2, money_3 = st.columns(3)
-        home_ml = money_1.number_input("主勝十進位賠率", min_value=1.01, value=2.00, step=0.01)
-        draw_ml = money_2.number_input("和局十進位賠率", min_value=1.01, value=3.20, step=0.01)
-        away_ml = money_3.number_input("客勝十進位賠率", min_value=1.01, value=3.00, step=0.01)
+        home_ml = money_1.number_input("主勝水位（不含本金）", min_value=0.001, value=1.00, step=0.001, format="%.3f")
+        draw_ml = money_2.number_input("和局水位（不含本金）", min_value=0.001, value=2.20, step=0.001, format="%.3f")
+        away_ml = money_3.number_input("客勝水位（不含本金）", min_value=0.001, value=2.00, step=0.001, format="%.3f")
         save_event = st.form_submit_button("儲存此場人工校正")
     if save_event:
         try:
             home_line = _parse_home_asian_handicap(home_line_text)
             markets = [
-                {"market_type": "spread", "side": "home", "line": home_line, "decimal_price": home_spread},
-                {"market_type": "spread", "side": "away", "line": -home_line, "decimal_price": away_spread},
-                {"market_type": "total", "side": "over", "line": total_line, "decimal_price": over_price},
-                {"market_type": "total", "side": "under", "line": total_line, "decimal_price": under_price},
-                {"market_type": "moneyline", "side": "home", "line": None, "decimal_price": home_ml},
-                {"market_type": "moneyline", "side": "draw", "line": None, "decimal_price": draw_ml},
-                {"market_type": "moneyline", "side": "away", "line": None, "decimal_price": away_ml},
+                {"market_type": "spread", "side": "home", "line": home_line, "decimal_price": hk_to_decimal(home_spread)},
+                {"market_type": "spread", "side": "away", "line": -home_line, "decimal_price": hk_to_decimal(away_spread)},
+                {"market_type": "total", "side": "over", "line": total_line, "decimal_price": hk_to_decimal(over_price)},
+                {"market_type": "total", "side": "under", "line": total_line, "decimal_price": hk_to_decimal(under_price)},
+                {"market_type": "moneyline", "side": "home", "line": None, "decimal_price": hk_to_decimal(home_ml)},
+                {"market_type": "moneyline", "side": "draw", "line": None, "decimal_price": hk_to_decimal(draw_ml)},
+                {"market_type": "moneyline", "side": "away", "line": None, "decimal_price": hk_to_decimal(away_ml)},
             ]
             app.football.apply_manual_calibration(date_str, event_id, markets)
             home_direction = "主隊讓分" if home_line < 0 else "主隊受讓" if home_line > 0 else "平手盤"
@@ -299,6 +302,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
 def _admin_page(app: AppServices) -> None:
     _render_brand()
     st.header("後台｜資料更新、人工校正與發布")
+    render_member_link(st)
     st.warning("僅此頁按鈕會抓取、運算或寫入資料；會員查詢頁不會執行這些操作。")
     selected = st.date_input("作業日期", value=_taipei_now().date(), key="admin_date")
     date_str = selected.isoformat()
