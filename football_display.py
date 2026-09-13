@@ -163,3 +163,6 @@ def translate_teams(text, home, away):
         if team:
             value = value.replace(team, team_name(team))
     return value
+
+# Original APP baseball display names, never used for provider identity.
+TEAM_NAMES.update({name_key(k): v for k, v in {'New York Yankees': '洋基', 'Baltimore Orioles': '金鶯', 'Boston Red Sox': '紅襪', 'Tampa Bay Rays': '光芒', 'Toronto Blue Jays': '藍鳥', 'Chicago White Sox': '白襪', 'Cleveland Guardians': '守護者', 'Detroit Tigers': '老虎', 'Kansas City Royals': '皇家', 'Minnesota Twins': '雙城', 'Houston Astros': '太空人', 'Los Angeles Angels': '天使', 'Oakland Athletics': '運動家', 'Athletics': '運動家', 'Seattle Mariners': '水手', 'Texas Rangers': '遊騎兵', 'Atlanta Braves': '勇士', 'Miami Marlins': '馬林魚', 'New York Mets': '大都會', 'Philadelphia Phillies': '費城人', 'Washington Nationals': '國民', 'Chicago Cubs': '小熊', 'Cincinnati Reds': '紅人', 'Milwaukee Brewers': '釀酒人', 'Pittsburgh Pirates': '海盜', 'St. Louis Cardinals': '紅雀', 'Arizona Diamondbacks': '響尾蛇', 'Colorado Rockies': '落磯', 'Los Angeles Dodgers': '道奇', 'San Diego Padres': '教士', 'San Francisco Giants': '巨人'}.items()})

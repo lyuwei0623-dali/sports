@@ -187,11 +187,21 @@ class FootballModule:
         espn_index = self._fetch_espn_fixtures(target)
         api_events: list[dict[str, Any]] = []
         api_football_status = "not_configured"
+        valid_seasons = {
+            league: season for league, season in season_by_league.items()
+            if league in DEFAULT_LEAGUES and isinstance(season, int) and season >= 1900
+        }
         if not self.config.api_football_key:
             self._source_diagnostics["API-Football"] = "未設定金鑰，使用 ESPN 賽程"
-        if self.config.api_football_key:
+        elif not valid_seasons:
+            # ESPN remains a valid schedule source. A missing optional
+            # enrichment configuration must not turn a member-visible daily
+            # schedule into an application-wide failure.
+            self._source_diagnostics["API-Football"] = "未設定可用賽季，使用 ESPN 賽程"
+            api_football_status = "season_not_configured"
+        else:
             try:
-                api_events = self._fetch_api_football_fixtures(target, season_by_league)
+                api_events = self._fetch_api_football_fixtures(target, valid_seasons)
                 api_football_status = "ok" if api_events else "empty"
             except Exception as exc:
                 self._source_diagnostics["API-Football"] = _provider_failure(exc)
@@ -233,9 +243,14 @@ class FootballModule:
             matched_count = conn.execute("SELECT COUNT(*) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
             self._source_diagnostics["盤口匹配"] = f"來源 {len(odds)} 筆；成功對應賽事 {matched_count} 筆"
             unmatched = sorted({name for e in primary_events for name in (e["home"], e["away"]) if _team_key(name) not in elo})
-            self._source_diagnostics["ClubElo 匹配"] = (
-                "來源未取得評分，尚無法進行匹配" if not elo else
-                f"未對應 {len(unmatched)} 隊：" + "、".join(unmatched))
+            if not elo:
+                self._source_diagnostics["ClubElo 匹配"] = "來源未取得評分，尚無法進行匹配"
+            elif not unmatched:
+                self._source_diagnostics["ClubElo 匹配"] = "當日賽程隊伍已完整匹配"
+            else:
+                self._source_diagnostics["ClubElo 匹配"] = (
+                    f"未對應 {len(unmatched)} 隊：" + "、".join(unmatched)
+                )
             summary = {"api_football_events": len(api_events), "api_football_status": api_football_status,
                        "espn_events": len(espn_index), "primary_events": len(primary_events),
                        "clubelo_teams": len(elo), "odds_quotes": len(odds), "diagnostics": dict(getattr(self, "_source_diagnostics", {}))}
@@ -258,7 +273,6 @@ class FootballModule:
         """
         attempted_at = _timestamp(now)
         try:
-            self._validate_auto_snapshot_seasons(season_by_league)
             refresh_result = self.refresh_daily_snapshot(date_str, season_by_league)
             if not refresh_result.get("events"):
                 raise AutoSnapshotDiagnosticError("no_events", "當日查無可用足球賽事")
@@ -1101,9 +1115,14 @@ _TEAM_ALIASES = {
     "borussiadortmund": "dortmund", "bayerleverkusen": "leverkusen",
     "borussiamonchengladbach": "gladbach", "rbleipzig": "leipzig",
     "internazionale": "inter", "intermilan": "inter", "acmilan": "milan",
-    "parissaintgermain": "psg", "atleticomadrid": "atletico",
+    "parissaintgermain": "psg", "parissg": "psg", "psg": "psg",
+    "atleticomadrid": "atletico", "atlmadrid": "atletico",
     "athleticclub": "bilbao", "athleticbilbao": "bilbao",
-    "celtavigo": "celta", "realbetis": "betis", "realsociedad": "sociedad",
+    "athbilbao": "bilbao", "celtavigo": "celta", "realbetis": "betis",
+    "realsociedad": "sociedad",
+    "bdortmund": "dortmund", "monchengladbach": "gladbach",
+    "mgladbach": "gladbach", "psveindhoven": "psv",
+    "rcdespanyol": "espanyol", "dalaves": "alaves",
 }
 
 def _provider_failure(exc):

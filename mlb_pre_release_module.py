@@ -190,6 +190,9 @@ class PublishedGame:
             "event_id": self.game.event_id,
             "kickoff": self.game.kickoff,
             "teams": {"away": self.game.away, "home": self.game.home},
+            "pitchers_display": "客：" + str((self.game.away_pitcher or {}).get("fullName") or "尚未確認") +
+                                "\n主：" + str((self.game.home_pitcher or {}).get("fullName") or "尚未確認"),
+            "venue_display": self.game.venue_name,
             "first_market": first_market,
             "latest_market": latest_market,
             "market_change": market_change,
@@ -718,7 +721,7 @@ def _with_stale_warning(payload: Mapping[str, Any], note: str) -> dict[str, Any]
 
 
 class HTTP:
-    def __init__(self, timeout: int = 20):
+    def __init__(self, timeout: int = 12):
         self.timeout = timeout
         self._cache = {}
 
@@ -914,10 +917,13 @@ class MLBOfficialClient:
 
     def games_for_taiwan_date(self, day: date) -> list[Game]:
         start = (day - timedelta(days=1)).isoformat()
-        end = (day + timedelta(days=1)).isoformat()
+        # Taiwan's day spans the prior UTC afternoon through the current UTC
+        # afternoon. Querying one unnecessary future MLB date roughly doubles
+        # the schedule payload on a full slate and was a common timeout source.
+        end = day.isoformat()
         payload = self.http.get_json(
             f"{MLB_API}/schedule", sportId=1, startDate=start, endDate=end,
-            hydrate="probablePitcher,venue,linescore,officials",
+            hydrate="probablePitcher,venue",
         )
         games: list[Game] = []
         for game_day in payload.get("dates", []):
@@ -1094,6 +1100,7 @@ class MLBPreReleaseService:
         *,
         first_super_quotes: Optional[Mapping[str, Iterable[SuperQuote]]] = None,
         calibrated_at: Optional[str] = None,
+        games: Optional[Iterable[Game]] = None,
     ) -> list[PublishedGame]:
         """Calculate with latest quotes and attach optional first-quote history.
 
@@ -1109,11 +1116,19 @@ class MLBPreReleaseService:
         except Exception:
             savant_probables = set()
         output = []
-        for game in self.mlb.games_for_taiwan_date(release_day):
+        # The automatic runner already fetched the official schedule to match
+        # live markets. Reuse that exact list so a second schedule request
+        # cannot make a successful run look like a no-games failure.
+        scheduled_games = tuple(games) if games is not None else tuple(self.mlb.games_for_taiwan_date(release_day))
+        for game in scheduled_games:
             risk = self._risk(game, savant_probables)
             away = self._team_feature(game.away, game.away_team_id, game.home_pitcher, release_day)
             home = self._team_feature(game.home, game.home_team_id, game.away_pitcher, release_day)
-            weather_multiplier, _ = self.weather.multiplier(self.mlb.venue_coordinates(game.venue_id), game.kickoff)
+            try:
+                coordinates = self.mlb.venue_coordinates(game.venue_id)
+            except Exception:
+                coordinates = None
+            weather_multiplier, _ = self.weather.multiplier(coordinates, game.kickoff)
             model = self._model(game, home, away, weather_multiplier)
             calibrated_quotes = tuple(super_quotes.get(game.event_id, ()))
             initial_quotes = tuple(
@@ -1143,13 +1158,19 @@ class MLBPreReleaseService:
         return DataRisk(level, tuple(reasons), "預定先發" if len(names) == 2 else "TBA／未完整", "推估打線", datetime.now(TZ_TAIPEI).isoformat())
 
     def _team_feature(self, name: str, team_id: Optional[int], opposing_pitcher: Optional[Mapping[str, Any]], day: date) -> TeamFeature:
-        lineups = self.mlb.recent_starting_lineups(team_id, day) if team_id else []
+        try:
+            lineups = self.mlb.recent_starting_lineups(team_id, day) if team_id else []
+        except Exception:
+            lineups = []
         projected = projected_lineup(lineups)
         hand = "LHP" if opposing_pitcher and opposing_pitcher.get("pitchHand", {}).get("code") == "L" else "RHP"
         xwobas = [self.savant.player_xwoba(pid, day) for pid in projected]
         values = [v for v in xwobas if v is not None and .20 <= v <= .45]
         lineup_xwoba = float(np.mean(values)) if values else .315
-        multiplier, note = self.mlb.bullpen_usage(team_id, day) if team_id else (1.0, "牛棚資料未取得")
+        try:
+            multiplier, note = self.mlb.bullpen_usage(team_id, day) if team_id else (1.0, "牛棚資料未取得")
+        except Exception:
+            multiplier, note = 1.0, "牛棚資料暫時無法取得；本次不調整"
         return TeamFeature(name, tuple(projected), lineup_xwoba, multiplier, note, hand)
 
     def _model(self, game: Game, home: TeamFeature, away: TeamFeature, weather_multiplier: float) -> ModelOutput:
@@ -1241,7 +1262,8 @@ class MLBAutoSnapshotRunner:
                 for game in games
             }
             quotes = {game.event_id: _automatic_quotes(decisions[game.event_id]) for game in games}
-            calculated = self.service.run(day, quotes, calibrated_at=_as_taipei_iso(current))
+            calculated = self.service.run(
+                day, quotes, calibrated_at=_as_taipei_iso(current), games=games)
             previous = self.store.get_automatic_snapshot_for_backend(date_str)
             previous_by_event = {
                 str(payload.get("event_id")): payload

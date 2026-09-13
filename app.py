@@ -5,8 +5,8 @@ calculate and save snapshots.  Sport calculation rules remain in their modules.
 """
 from __future__ import annotations
 
-import json
 import os
+from base64 import b64encode
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,20 +15,20 @@ import streamlit as st
 
 from admin_snapshot_ui import render_snapshot_result
 from app_services import AppServices, compose_services
-from member_release_service import render_member_view
+from member_experience import show_report
+from live_ui import render_live
+from source_health import check_sources
 from mlb_pre_release_module import (
     MLBAutoSnapshotRunner, MLBPreReleaseService, SuperQuote, parse_super_line,
 )
 
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 APP_NAME = "維大力體育APP"
-APP_BUILD = "2026-09-12-v7"
-
-st.set_page_config(page_title=APP_NAME, page_icon="⚽", layout="wide")
+st.set_page_config(page_title=APP_NAME, page_icon="⚽", layout="wide", initial_sidebar_state="collapsed")
 
 
-@st.cache_resource(show_spinner=False)
 def services() -> AppServices:
+    # Avoid retaining old module/service instances across a source update.
     return compose_services()
 
 
@@ -37,24 +37,25 @@ def _taipei_now() -> datetime:
 
 
 def _render_brand() -> None:
-    """Render the supplied anti-counterfeit logo when it is deployed."""
-    logo = next((Path(name) for name in ("logo.png", "logo.jpg", "logo.jpeg") if Path(name).is_file()), None)
-    logo_column, title_column = st.columns([1, 5])
-    with logo_column:
-        if logo is not None:
-            st.image(str(logo), width=150)
-    with title_column:
-        st.title(APP_NAME)
-        st.caption("MLB／Football 賽事數據分析與推薦")
-
-
-def _render_sidebar_brand() -> None:
-    logo = next((Path(name) for name in ("logo.png", "logo.jpg", "logo.jpeg") if Path(name).is_file()), None)
-    with st.sidebar:
-        if logo is not None:
-            st.image(str(logo), use_container_width=True)
-        st.markdown("### 維大力體育APP")
-        st.caption("官方防偽識別｜請認明大力體育 Logo")
+    logo = Path(__file__).with_name("logo.png")
+    logo_src = ""
+    if logo.exists():
+        logo_src = "data:image/png;base64," + b64encode(logo.read_bytes()).decode("ascii")
+    image = f'<img class="dali-brand__logo" src="{logo_src}" alt="大力體育防偽 LOGO">' if logo_src else ""
+    watermark = f"background-image:url('{logo_src}');" if logo_src else ""
+    st.markdown(f"""<style>
+      .block-container {{padding-top:1.25rem;max-width:1500px;}}
+      [data-testid="stSidebar"] {{display:none;}}
+      .dali-brand {{display:flex;align-items:center;gap:13px;background:linear-gradient(100deg,#0b1220,#1e293b);border:1px solid #334155;padding:10px 15px;border-radius:12px;margin:0 0 14px;box-shadow:0 4px 13px rgba(15,23,42,.16);}}
+      .dali-brand__logo {{width:68px;height:68px;object-fit:contain;background:#fff;border-radius:50%;border:2px solid #fbbf24;box-shadow:0 2px 7px rgba(251,191,36,.35);}}
+      .dali-brand__title {{color:#f8fafc;font-size:20px;font-weight:850;letter-spacing:.3px;line-height:1.18;}}
+      .dali-brand__sub {{color:#cbd5e1;font-size:12px;margin-top:3px;}}
+      .dali-brand__mark {{margin-left:auto;color:#fbbf24;font-size:12px;font-weight:800;white-space:nowrap;}}
+      .dali-watermark {{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.027;background-position:center 55%;background-repeat:no-repeat;background-size:300px;{watermark}}}
+      @media(max-width:700px){{.block-container{{padding:1rem .7rem;}}.dali-brand__logo{{width:54px;height:54px;}}.dali-brand__title{{font-size:17px;}}.dali-brand__mark{{display:none;}}}}
+    </style>
+    <div class="dali-watermark"></div>
+    <div class="dali-brand">{image}<div><div class="dali-brand__title">維大力體育APP</div><div class="dali-brand__sub">有依據的賽事分析・盤口價值・單場風險</div></div><div class="dali-brand__mark">官方會員分析</div></div>""", unsafe_allow_html=True)
 
 
 def _login() -> None:
@@ -80,19 +81,17 @@ def _login() -> None:
 
 def _member_page(app: AppServices) -> None:
     _render_brand()
-    st.caption("賽前推薦｜MLB／Football｜會員端只讀取已保存快照")
-    selected = st.date_input("查詢日期", value=_taipei_now().date(), key="member_date")
-    date_str = selected.isoformat()
-    mlb_tab, football_tab = st.tabs(["⚾ MLB", "⚽ Football"])
-    with mlb_tab:
-        st.button("查詢 MLB 已儲存推薦", key="query_mlb")
-        gate = app.members.get_mlb_member_view(date_str, now=_taipei_now())
-        st.markdown(render_member_view(gate), unsafe_allow_html=True)
-    with football_tab:
-        st.button("查詢足球已儲存推薦", key="query_football")
-        gate = app.members.get_football_member_view(date_str, now=_taipei_now())
-        st.markdown(render_member_view(gate), unsafe_allow_html=True)
-    st.caption("機率高不等於值得下注。")
+    section = st.radio("查詢功能", ["MLB", "歐洲足球", "走地計算機"], horizontal=True, label_visibility="collapsed")
+    if section == "走地計算機":
+        render_live(st)
+        return
+    selected = st.date_input("賽事日期（台灣）", value=_taipei_now().date(), key="member_date")
+    sport = "mlb" if section == "MLB" else "football"
+    if st.button("讀取已保存的賽事分析", type="primary", key=f"query_saved:{sport}"):
+        st.session_state[f"member_query:{sport}:{selected.isoformat()}"] = _taipei_now().strftime("%m/%d %H:%M")
+    gate = app.members.get_member_view(sport, selected.isoformat(), now=_taipei_now())
+    show_report(st, gate)
+    st.caption("機率高不等於值得下注。資料更新由管理員執行；會員查詢不抓取即時盤口。")
 
 
 def _matchup_label(row: dict[str, object], sport: str) -> str:
@@ -183,7 +182,7 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
                 result = app.mlb_store.confirm_daily_release(date_str, note="管理員人工 SUPER 校正")
             st.session_state.pop(f"mlb_manual_quotes:{date_str}", None)
             render_snapshot_result(st, result, "mlb")
-            st.markdown(render_member_view(app.members.get_mlb_admin_preview(date_str)), unsafe_allow_html=True)
+            show_report(st, app.members.get_mlb_admin_preview(date_str), admin=True)
         except Exception:
             st.error("MLB 人工校正發布失敗，請確認所有盤口格式後重試。")
 
@@ -234,7 +233,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
             app.football.confirm_daily_release(date_str, note="管理員人工亞洲盤校正")
             render_snapshot_result(st, {"status": "published", "updated_at": _taipei_now().isoformat(),
                                         "snapshot_kind": "manual", "member_available": True}, "football")
-            st.markdown(render_member_view(app.members.get_football_admin_preview(date_str)), unsafe_allow_html=True)
+            show_report(st, app.members.get_football_admin_preview(date_str), admin=True)
         except Exception:
             st.error("尚有比賽未完成人工校正，請逐場儲存後再發布。")
 
@@ -245,27 +244,34 @@ def _admin_page(app: AppServices) -> None:
     st.warning("僅此頁按鈕會抓取、運算或寫入資料；會員查詢頁不會執行這些操作。")
     selected = st.date_input("作業日期", value=_taipei_now().date(), key="admin_date")
     date_str = selected.isoformat()
-    mlb_tab, football_tab = st.tabs(["MLB 後台", "Football 後台"])
+    with st.expander("資料來源檢查與設定", expanded=False):
+        st.caption("金鑰請放在 Streamlit Secrets，這裡不會顯示金鑰，也不會要求會員輸入。")
+        if st.button("檢查資料連線", key="check_sources"):
+            with st.spinner("正在檢查資料來源…"):
+                st.session_state["source_health"] = check_sources(os.environ.get("THE_ODDS_API_KEY", "").strip(), os.environ.get("API_FOOTBALL_KEY", "").strip(), date_str)
+        if "source_health" in st.session_state:
+            st.dataframe(st.session_state["source_health"], hide_index=True, use_container_width=True)
+        st.caption("The Odds API 金鑰 → THE_ODDS_API_KEY；API-Football 金鑰 → API_FOOTBALL_KEY。兩者不同，也不是帳戶登入密碼。")
+    mlb_tab, football_tab = st.tabs(["MLB 後台", "足球後台"])
 
     with mlb_tab:
         st.subheader("MLB 自動存取快照")
         if st.button("立即執行 MLB 自動快照", type="primary"):
             key = os.environ.get("THE_ODDS_API_KEY", "")
-            if not key:
-                st.error("尚未設定 MLB 所需資料來源，請確認後台設定。")
-            else:
-                try:
-                    with st.spinner("正在取得 MLB 資料、運算並儲存快照…"):
-                        result = MLBAutoSnapshotRunner(app.mlb_store).run(date_str, key, now=_taipei_now())
-                    summary = render_snapshot_result(st, result, "mlb")
-                    if summary.success and summary.member_available == "是":
-                        st.success("本次運算已保存，完整賽表顯示於下方。")
-                except Exception:
-                    st.error("MLB 自動快照執行失敗，APP 已保護會員頁不受影響。請確認部署檔案版本與資料來源設定。")
+            try:
+                with st.spinner("正在取得 MLB 賽程、運算並儲存快照…"):
+                    result = MLBAutoSnapshotRunner(app.mlb_store).run(date_str, key, now=_taipei_now())
+                summary = render_snapshot_result(st, result, "mlb")
+                if summary.success and summary.member_available == "是":
+                    st.success("本次運算已保存，完整賽表顯示於下方。")
+                    if not key:
+                        st.info("未設定 The Odds API 金鑰：已保存 MLB 官方完整賽表；缺少可驗證市場盤的場次會標示 PASS。")
+            except Exception:
+                st.error("MLB 自動快照執行失敗，APP 已保護會員頁不受影響。請在「資料來源檢查」確認 MLB 官方與 The Odds API。")
         preview = app.members.get_mlb_admin_preview(date_str)
         if preview.allowed and preview.report is not None:
             st.markdown("#### 當天完整 MLB 賽表與推薦")
-            st.markdown(render_member_view(preview), unsafe_allow_html=True)
+            show_report(st, preview, admin=True)
         _mlb_manual_section(app, selected, date_str)
 
     with football_tab:
@@ -277,32 +283,32 @@ def _admin_page(app: AppServices) -> None:
                 summary = render_snapshot_result(st, result, "football")
                 if summary.success and summary.member_available == "是":
                     st.success("本次運算已保存，完整賽表顯示於下方。")
+                    if not app.seasons:
+                        st.info("未設定 API-Football 賽季：本次已使用 ESPN 賽程備援；未取得的補強資料會如實標示風險。")
             except Exception:
-                st.error("Football 自動快照執行失敗，APP 已保護會員頁不受影響。請確認聯賽賽季與資料來源設定。")
+                st.error("Football 自動快照執行失敗，APP 已保護會員頁不受影響。請在「資料來源檢查」確認 ESPN、API-Football、ClubElo 與 The Odds API。")
         preview = app.members.get_football_admin_preview(date_str)
         if preview.allowed and preview.report is not None:
             st.markdown("#### 當天完整 Football 賽表與推薦")
-            st.markdown(render_member_view(preview), unsafe_allow_html=True)
+            show_report(st, preview, admin=True)
         _football_manual_section(app, date_str)
 
 
 def main() -> None:
-    _render_sidebar_brand()
-    st.sidebar.caption("程式版本：" + APP_BUILD)
     role = st.session_state.get("user_role")
     if role not in {"member", "admin"}:
         _login()
     app = services()
     if role == "admin":
-        _admin_page(app)
+        page = st.radio("管理員功能", ["管理後台", "會員畫面預覽"], horizontal=True)
+        if page == "管理後台": _admin_page(app)
+        else: _member_page(app)
     else:
         _member_page(app)
-    with st.sidebar:
-        st.divider()
-        st.caption("維大力體育APP｜會員端唯讀快照")
-        if st.button("登出"):
-            st.session_state.clear()
-            st.rerun()
+    st.divider()
+    if st.button("登出", key="logout"):
+        st.session_state.clear()
+        st.rerun()
 
 
 if __name__ == "__main__":

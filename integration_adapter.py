@@ -8,7 +8,7 @@ stable Core presentation contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -21,8 +21,6 @@ except ModuleNotFoundError:  # pragma: no cover - used when imported as a packag
 
 
 TZ_TW = ZoneInfo("Asia/Taipei")
-MEMBER_OPEN_TIME = time(19, 30)
-
 # This is the Core-owned member-table contract.  Sport modules may not reorder
 # or replace these columns; they only provide display-ready cell values.
 MEMBER_REPORT_COLUMNS: tuple[ReportColumn, ...] = (
@@ -70,10 +68,11 @@ def mlb_payloads_to_shared_report(payloads: Iterable[Any]) -> SharedReport:
         model = _value(payload, "model", "資料未提供")
         sources = _value(payload, "sources", "資料來源未提供")
         cells = {
-            "event_meta": _event_meta(_value(payload, "kickoff", "未提供"), sport),
-            "matchup": _matchup(away, home),
-            "market": _market_text(payload),
-            "recommendation": _recommendation_text(recommendations),
+            "event_meta": _format_taipei_kickoff(_value(payload, "kickoff", "未提供")),
+            "matchup": f"{team_name(away)}（客）\n{team_name(home)}（主）",
+            "pitchers": _text(_value(payload, "pitchers_display", "舊快照未保存先發資訊")),
+            "market": translate_teams(_market_text(payload), home, away),
+            "recommendation": translate_teams(_recommendation_text(recommendations), home, away),
             "model_ev": _model_ev_text(model, recommendations),
             "risk_warning": _join_text(risk, warning) or "無額外警語",
             "source_timing": _source_timing(sources, payload),
@@ -90,6 +89,8 @@ def football_rows_to_shared_report(rows: Iterable[Any], run_metadata: Mapping[st
     for row in rows:
         home, away = str(_value(row, "home", "")), str(_value(row, "away", ""))
         forecast = _value(row, "forecast", {}) or {}
+        if not isinstance(forecast, Mapping):
+            forecast = {}
         evaluations = _value(row, "market_evaluations", ()) or ()
         recommendations = _value(row, "recommendations", ()) or ()
         warning = _join_text(_text(_value(row, "risk", "")), _text(_value(row, "warning", "")))
@@ -127,24 +128,44 @@ def _number(value):
         return "—"
 
 
+def _as_float(value: Any) -> Optional[float]:
+    """Best-effort display conversion; malformed old snapshots stay readable."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _percent(value: Any, *, signed: bool = False, missing: str = "尚未儲存") -> str:
+    number = _as_float(value)
+    if number is None:
+        return missing
+    return f"{number:+.1%}" if signed else f"{number:.1%}"
+
+
 def _forecast_probabilities(forecast):
     values = []
     for key, label in (("home_probability", "主勝"), ("draw_probability", "和局"), ("away_probability", "客勝")):
         value = forecast.get(key)
-        values.append(f"{label} {float(value):.1%}" if value is not None else f"{label} 尚未儲存")
+        values.append(f"{label} {_percent(value)}")
     return "\n".join(values)
 
 
 def _football_pick(recommendations, market_type, home, away, evaluations=()):
     picks = [p for p in _eligible_recommendations(recommendations) if _value(p, "market_type") == market_type]
     if not picks:
-        values = [float(_value(p, "ev")) for p in evaluations
-                  if _value(p, "market_type") == market_type and _value(p, "ev") is not None]
+        values = [_as_float(_value(p, "ev")) for p in evaluations
+                  if _value(p, "market_type") == market_type]
+        values = [value for value in values if value is not None]
         if values:
-            return f"PASS｜未達推薦門檻；最高 EV {max(values):+.1%}"
-        return "PASS｜無可用盤口或未達推薦門檻；EV —"
-    return "\n".join(translate_teams(str(_value(p, "display", _value(p, "selection", "推薦"))), home, away)
-                     + f"｜EV {float(_value(p, 'ev')):+.1%}" for p in picks)
+            return f"暫不推薦｜最高 EV {max(values):+.1%}"
+        return "無法評估｜缺少有效盤口或運算結果"
+    return "\n".join(
+        translate_teams(str(_value(p, "display", _value(p, "selection", "推薦"))), home, away)
+        + f"｜EV {_percent(_value(p, 'ev'), signed=True, missing='未提供')}"
+        for p in picks
+    )
 
 
 def member_release_gate(
@@ -159,12 +180,13 @@ def member_release_gate(
     The gate neither accepts a refresh callback nor invokes a sport module.
     """
 
-    release_status = ReleaseStatus(status)
+    try:
+        release_status = ReleaseStatus(status)
+    except ValueError:
+        release_status = ReleaseStatus.FETCHING
     now_tw = (now or datetime.now(TZ_TW)).astimezone(TZ_TW)
     if release_status is ReleaseStatus.FAILED:
         return MemberReleaseGate(False, release_status, "今日資料取得或盤口校正失敗，暫不提供推薦。")
-    if now_tw.time() < MEMBER_OPEN_TIME:
-        return MemberReleaseGate(False, release_status, "今日推薦將於台灣時間 19:30 後開放。")
     if release_status is ReleaseStatus.FETCHING:
         return MemberReleaseGate(False, release_status, "今日賽事數據分析中。")
     if release_status is ReleaseStatus.AWAITING_MANUAL_CALIBRATION:
@@ -269,8 +291,16 @@ def _market_text(source: Any) -> str:
 def _recommendation_text(recommendations: Any) -> str:
     picks = _eligible_recommendations(recommendations)
     if not picks:
-        return "PASS｜無 +EV 且 playable 的推薦"
-    return "\n".join(_text(_value(pick, "display", _value(pick, "selection", _value(pick, "label", "推薦")))) for pick in picks)
+        return "暫不推薦｜未達門檻" if recommendations else "無法評估｜缺少有效盤口或運算結果"
+    values = []
+    for pick in picks:
+        selection = _text(_value(pick, "display", _value(pick, "selection", _value(pick, "label", "推薦"))))
+        probability = _value(pick, "model_probability", _value(pick, "probability"))
+        values.append(
+            selection
+            + f"\n模型 {_percent(probability)}｜EV {_percent(_value(pick, 'ev'), signed=True, missing='未提供')}"
+        )
+    return "\n".join(values)
 
 
 def _model_ev_text(model: Any, recommendations: Any) -> str:
@@ -278,7 +308,10 @@ def _model_ev_text(model: Any, recommendations: Any) -> str:
     for pick in _eligible_recommendations(recommendations):
         probability = _value(pick, "model_probability", _value(pick, "probability"))
         ev = _value(pick, "ev")
-        value = _join_text("模型機率：" + _text(probability) if probability is not None else "", "EV：" + _text(ev) if ev is not None else "")
+        value = _join_text(
+            "模型機率：" + _percent(probability) if probability is not None else "",
+            "EV：" + _percent(ev, signed=True, missing="未提供") if ev is not None else "",
+        )
         if value:
             parts.append(value)
     return "\n".join(parts) if parts else "模型／EV 資料未提供"
@@ -287,6 +320,8 @@ def _model_ev_text(model: Any, recommendations: Any) -> str:
 def _eligible_recommendations(recommendations: Any) -> list[Any]:
     if isinstance(recommendations, Mapping):
         recommendations = recommendations.get("items", ())
+    if not isinstance(recommendations, (list, tuple, set)):
+        return []
     picks = []
     for pick in recommendations:
         playable = _value(pick, "playable", False)

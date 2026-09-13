@@ -25,7 +25,11 @@ def compose_services() -> AppServices:
     data_dir.mkdir(parents=True, exist_ok=True)
     mlb_store = MLBReleaseSnapshotStore(str(data_dir / "mlb_release.sqlite3"))
     football = FootballModule.from_environment(str(data_dir / "football.sqlite3"))
-    return AppServices(mlb_store, football, MemberReleaseService(mlb_store, football), _football_seasons())
+    try:
+        seasons = _football_seasons()
+    except RuntimeError:
+        seasons = {}
+    return AppServices(mlb_store, football, MemberReleaseService(mlb_store, football), seasons)
 
 
 def _football_seasons() -> Mapping[str, int]:
