@@ -6,6 +6,7 @@ calculate and save snapshots.  Sport calculation rules remain in their modules.
 from __future__ import annotations
 
 import os
+import math
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,6 +18,7 @@ from app_services import AppServices, compose_services
 from member_experience import show_report
 from live_ui import render_live
 from source_health import check_sources
+from football_display import team_name
 from mlb_pre_release_module import (
     MLBAutoSnapshotRunner, MLBPreReleaseService, SuperQuote, parse_super_line,
 )
@@ -96,21 +98,67 @@ def _member_page(app: AppServices) -> None:
 def _matchup_label(row: dict[str, object], sport: str) -> str:
     if sport == "mlb":
         teams = row.get("teams") if isinstance(row.get("teams"), dict) else {}
-        return f"{teams.get('away', '客隊')} @ {teams.get('home', '主隊')}"
-    return f"{row.get('away', '客隊')} @ {row.get('home', '主隊')}"
+        away, home = teams.get("away", "客隊"), teams.get("home", "主隊")
+    else:
+        away, home = row.get("away", "客隊"), row.get("home", "主隊")
+    return f"{team_name(away)}（客） vs {team_name(home)}（主）"
 
 
-def _signed_mlb_line(raw: str, expected_sign: str) -> str:
+def _normalise_mlb_home_line(raw: str) -> str:
+    """Validate the one home-team SUPER line entered by the administrator.
+
+    The domain parser remains the authoritative implementation for SUPER
+    settlement.  This UI helper deliberately requires the leading sign, so the
+    selected side can never be silently inverted: ``-`` means the home team
+    gives points and ``+`` means it receives points.
+    """
+
     value = str(raw).strip().replace(" ", "")
     if not value:
-        raise ValueError("讓分盤口不可空白")
-    if value[0] in "+-":
-        if value[0] != expected_sign:
-            raise ValueError("讓分／受讓方向與盤口正負號不一致")
-    else:
-        value = expected_sign + value
+        raise ValueError("主隊讓分盤口不可空白")
+    if value[0] not in "+-":
+        raise ValueError("請以 + 或 - 開頭：- 代表主隊讓分，+ 代表主隊受讓")
     parse_super_line(value)
     return value
+
+
+def _opponent_mlb_line(home_line: str) -> str:
+    """Return the opposite-team line without changing SUPER's ratio syntax."""
+
+    return ("+" if home_line.startswith("-") else "-") + home_line[1:]
+
+
+def _parse_home_asian_handicap(raw: str) -> float:
+    """Read one signed home-team Asian handicap without changing AH rules.
+
+    The Football module still validates and settles the resulting number.  The
+    slash form is a convenient administrator input for quarter lines, e.g.
+    ``-0/0.5`` or ``+0.5/1``.
+    """
+
+    text = str(raw).strip().replace(" ", "")
+    if text.upper() in {"PK", "平"}:
+        return 0.0
+    if not text or text[0] not in "+-":
+        raise ValueError("請以 + 或 - 開頭：- 代表主隊讓分，+ 代表主隊受讓")
+    sign, body = (-1.0 if text[0] == "-" else 1.0), text[1:]
+    if not body:
+        raise ValueError("請輸入主隊亞洲讓分數值，例如 -0.5、+0.5、-0/0.5")
+    try:
+        if "/" in body:
+            values = [float(part) for part in body.split("/")]
+            if len(values) != 2 or any(value < 0 for value in values):
+                raise ValueError
+            if not math.isclose(abs(values[1] - values[0]), 0.5):
+                raise ValueError
+            line = sign * sum(values) / 2
+        else:
+            line = sign * float(body)
+    except ValueError as exc:
+        raise ValueError("亞洲盤格式請填 -0.5、+0.5、-0/0.5 或 +0.5/1") from exc
+    if not math.isclose(line * 4, round(line * 4)):
+        raise ValueError("亞洲盤只接受 0.25 的倍數")
+    return line
 
 
 def _positive(value: float, label: str) -> float:
@@ -128,17 +176,19 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
     if not rows:
         st.info("請先執行 MLB 自動快照，取得當天完整賽程後再人工校正。")
         return
-    options = {f"{_matchup_label(row, 'mlb')}｜{row.get('event_id')}": row for row in rows}
-    chosen = st.selectbox("選擇要校正的比賽", tuple(options), key=f"mlb_event:{date_str}")
-    row = options[chosen]
+    event_indexes = tuple(range(len(rows)))
+    row = rows[st.selectbox(
+        "選擇要校正的比賽", event_indexes,
+        format_func=lambda index: _matchup_label(rows[index], "mlb"),
+        key=f"mlb_event:{date_str}",
+    )]
     event_id = str(row.get("event_id"))
     with st.form(f"mlb_manual:{date_str}:{event_id}"):
-        direction = st.radio("主隊方向", ("主隊讓分", "主隊受讓"), horizontal=True)
-        spread_1, spread_2 = st.columns(2)
-        home_line = spread_1.text_input("主隊讓分盤口", value="-1.5" if direction == "主隊讓分" else "+1.5",
-                                        help="支援 -1.5、-1+65、+1-50 等完整 SUPER 寫法")
-        away_line = spread_2.text_input("客隊讓分盤口", value="+1.5" if direction == "主隊讓分" else "-1.5",
-                                        help="請輸入與主隊相反方向的完整盤口")
+        home_line = st.text_input(
+            "主隊讓分盤（- 主隊讓分；+ 主隊受讓）", value="-1.5",
+            help="只需填主隊一格。支援 -1.5、+1.5、-1+85、+1-60 等完整 SUPER 寫法；客隊盤會自動反向。",
+        )
+        st.caption("特殊盤請完整輸入基準與比例，例如「-1+85」或「+1-60」；+85 單獨只代表比例，沒有讓分基準，無法正確結算。")
         spread_price_1, spread_price_2 = st.columns(2)
         home_spread_price = spread_price_1.number_input("主隊讓分盤香港賠率", min_value=0.01, value=0.94, step=0.01)
         away_spread_price = spread_price_2.number_input("客隊讓分盤香港賠率", min_value=0.01, value=0.94, step=0.01)
@@ -152,12 +202,12 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
         save_event = st.form_submit_button("儲存此場人工校正")
     if save_event:
         try:
-            home_sign = "-" if direction == "主隊讓分" else "+"
-            away_sign = "+" if direction == "主隊讓分" else "-"
+            home_line = _normalise_mlb_home_line(home_line)
+            away_line = _opponent_mlb_line(home_line)
             parse_super_line(total_line)
             quotes = [
-                SuperQuote("spread", "home", _signed_mlb_line(home_line, home_sign), _positive(home_spread_price, "主隊讓分賠率")),
-                SuperQuote("spread", "away", _signed_mlb_line(away_line, away_sign), _positive(away_spread_price, "客隊讓分賠率")),
+                SuperQuote("spread", "home", home_line, _positive(home_spread_price, "主隊讓分賠率")),
+                SuperQuote("spread", "away", away_line, _positive(away_spread_price, "客隊讓分賠率")),
                 SuperQuote("total", "over", total_line.strip(), _positive(over_price, "大分賠率")),
                 SuperQuote("total", "under", total_line.strip(), _positive(under_price, "小分賠率")),
                 SuperQuote("moneyline", "home", None, _positive(home_moneyline, "主隊獨贏賠率")),
@@ -165,7 +215,8 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
             ]
             saved = st.session_state.setdefault(f"mlb_manual_quotes:{date_str}", {})
             saved[event_id] = quotes
-            st.success(f"已暫存人工盤口：{_matchup_label(row, 'mlb')}")
+            home_direction = "主隊讓分" if home_line.startswith("-") else "主隊受讓"
+            st.success(f"已暫存人工盤口：{_matchup_label(row, 'mlb')}｜{home_direction} {home_line}；客隊自動對應 {away_line}")
         except (TypeError, ValueError) as exc:
             st.error(str(exc))
     pending = st.session_state.get(f"mlb_manual_quotes:{date_str}", {})
@@ -189,18 +240,24 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
 def _football_manual_section(app: AppServices, date_str: str) -> None:
     snapshot = app.football.get_member_snapshot(date_str)
     rows = list(snapshot.get("rows") or [])
-    st.subheader("Football 人工校正與發布")
+    st.subheader("足球人工校正與發布")
     st.caption("逐場輸入標準亞洲盤與十進位賠率；儲存完成後再發布。")
     if not rows:
-        st.info("請先執行 Football 自動快照，取得當天完整賽程後再人工校正。")
+        st.info("請先執行足球自動快照，取得當天完整賽程後再人工校正。")
         return
-    options = {f"{_matchup_label(row, 'football')}｜{row.get('event_id')}": row for row in rows}
-    chosen = st.selectbox("選擇要校正的比賽", tuple(options), key=f"football_event:{date_str}")
-    row = options[chosen]
+    event_indexes = tuple(range(len(rows)))
+    row = rows[st.selectbox(
+        "選擇要校正的比賽", event_indexes,
+        format_func=lambda index: _matchup_label(rows[index], "football"),
+        key=f"football_event:{date_str}",
+    )]
     event_id = str(row.get("event_id"))
     with st.form(f"football_manual:{date_str}:{event_id}"):
         spread_1, spread_2, spread_3 = st.columns(3)
-        home_line = spread_1.number_input("主隊亞洲讓分（受讓填正數）", value=-0.5, step=0.25)
+        home_line_text = spread_1.text_input(
+            "主隊亞洲讓分（- 主讓；+ 主受讓）", value="-0.5",
+            help="只需填主隊一格。支援 -0.5、+0.5、-0/0.5、+0.5/1；客隊盤會自動反向。",
+        )
         home_spread = spread_2.number_input("主隊讓分盤十進位賠率", min_value=1.01, value=1.94, step=0.01)
         away_spread = spread_3.number_input("客隊讓分盤十進位賠率", min_value=1.01, value=1.94, step=0.01)
         total_1, total_2, total_3 = st.columns(3)
@@ -214,6 +271,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
         save_event = st.form_submit_button("儲存此場人工校正")
     if save_event:
         try:
+            home_line = _parse_home_asian_handicap(home_line_text)
             markets = [
                 {"market_type": "spread", "side": "home", "line": home_line, "decimal_price": home_spread},
                 {"market_type": "spread", "side": "away", "line": -home_line, "decimal_price": away_spread},
@@ -224,10 +282,11 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
                 {"market_type": "moneyline", "side": "away", "line": None, "decimal_price": away_ml},
             ]
             app.football.apply_manual_calibration(date_str, event_id, markets)
-            st.success(f"已儲存人工盤口：{_matchup_label(row, 'football')}")
-        except Exception:
-            st.error("Football 人工盤口儲存失敗，請確認盤口與賠率格式。")
-    if st.button("全部校正完成，發布 Football"):
+            home_direction = "主隊讓分" if home_line < 0 else "主隊受讓" if home_line > 0 else "平手盤"
+            st.success(f"已儲存人工盤口：{_matchup_label(row, 'football')}｜{home_direction} {home_line:+g}；客隊自動對應 {-home_line:+g}")
+        except (TypeError, ValueError) as exc:
+            st.error(str(exc))
+    if st.button("全部校正完成，發布足球"):
         try:
             app.football.confirm_daily_release(date_str, note="管理員人工亞洲盤校正")
             render_snapshot_result(st, {"status": "published", "updated_at": _taipei_now().isoformat(),
@@ -274,8 +333,8 @@ def _admin_page(app: AppServices) -> None:
         _mlb_manual_section(app, selected, date_str)
 
     with football_tab:
-        st.subheader("Football 自動存取快照")
-        if st.button("立即執行 Football 自動快照", type="primary"):
+        st.subheader("足球自動存取快照")
+        if st.button("立即執行足球自動快照", type="primary"):
             try:
                 with st.spinner("正在取得足球資料、運算並儲存快照…"):
                     result = app.football.run_football_auto_snapshot(date_str, app.seasons, now=_taipei_now())
@@ -285,10 +344,10 @@ def _admin_page(app: AppServices) -> None:
                     if not app.seasons:
                         st.info("未設定 API-Football 賽季：本次已使用 ESPN 賽程備援；未取得的補強資料會如實標示風險。")
             except Exception:
-                st.error("Football 自動快照執行失敗，APP 已保護會員頁不受影響。請在「資料來源檢查」確認 ESPN、API-Football、ClubElo 與 The Odds API。")
+                st.error("足球自動快照執行失敗，APP 已保護會員頁不受影響。請在「資料來源檢查」確認 ESPN、API-Football、ClubElo 與 The Odds API。")
         preview = app.members.get_football_admin_preview(date_str)
         if preview.allowed and preview.report is not None:
-            st.markdown("#### 當天完整 Football 賽表與推薦")
+            st.markdown("#### 當天完整足球賽表與推薦")
             show_report(st, preview, admin=True)
         _football_manual_section(app, date_str)
 

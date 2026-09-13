@@ -93,6 +93,7 @@ class FootballModule:
             db_path=db_path,
             api_football_key=os.environ.get("API_FOOTBALL_KEY", ""),
             odds_api_key=os.environ.get("THE_ODDS_API_KEY", ""),
+            odds_regions=os.environ.get("FOOTBALL_ODDS_REGIONS", "eu").strip() or "eu",
         ))
 
     def _db(self) -> sqlite3.Connection:
@@ -183,6 +184,7 @@ class FootballModule:
         replaced atomically per date.  Member UI must never call this method.
         """
         self._source_diagnostics = {}
+        self._api_football_odds_stats = {"attempted": 0, "events": 0, "quotes": 0}
         target = date.fromisoformat(date_str)
         espn_index = self._fetch_espn_fixtures(target)
         api_events: list[dict[str, Any]] = []
@@ -217,6 +219,18 @@ class FootballModule:
                 seen.add(identity)
         elo = self._fetch_clubelo(target)
         odds = self._fetch_odds_consensus(target)
+        # The Odds API is used first.  If it has no internally valid market for
+        # an API-Football fixture, use that already configured provider's
+        # pre-match odds endpoint as a narrowly-scoped fallback.  This avoids
+        # replacing the Football model or inventing a price, and it avoids a
+        # second provider call for events that already have usable odds.
+        fallback_by_event: dict[str, list[dict[str, Any]]] = {}
+        for event in primary_events:
+            if _has_usable_market_records(_match_odds(odds, event)):
+                continue
+            fallback = self._fetch_api_football_prematch_odds(event)
+            if _has_usable_market_records(fallback):
+                fallback_by_event[str(event["event_id"])] = fallback
         stored = 0
         with self._db() as conn:
             conn.execute("DELETE FROM football_events WHERE date_str=?", (date_str,))
@@ -233,6 +247,8 @@ class FootballModule:
                     json.dumps(model, ensure_ascii=False),
                 ))
                 matched = _match_odds(odds, event)
+                if not _has_usable_market_records(matched):
+                    matched = fallback_by_event.get(str(event["event_id"]), matched)
                 for q in matched:
                     conn.execute("""INSERT INTO football_market_reference VALUES(?,?,?,?,?,?,?,?,?,?)""", (
                         date_str, event["event_id"], q["market_type"], q["side"], q["line"],
@@ -241,7 +257,12 @@ class FootballModule:
                     ))
                 stored += 1
             matched_count = conn.execute("SELECT COUNT(*) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
-            self._source_diagnostics["盤口匹配"] = f"來源 {len(odds)} 筆；成功對應賽事 {matched_count} 筆"
+            priced_events = conn.execute("SELECT COUNT(DISTINCT event_id) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
+            fallback_stats = dict(self._api_football_odds_stats)
+            self._source_diagnostics["盤口匹配"] = (
+                f"The Odds API {len(odds)} 筆；API-Football 賽前盤補強 {fallback_stats['events']} 場；"
+                f"可用盤口 {priced_events}/{len(primary_events)} 場"
+            )
             unmatched = sorted({name for e in primary_events for name in (e["home"], e["away"]) if _team_key(name) not in elo})
             if not elo:
                 self._source_diagnostics["ClubElo 匹配"] = "來源未取得評分，尚無法進行匹配"
@@ -253,7 +274,11 @@ class FootballModule:
                 )
             summary = {"api_football_events": len(api_events), "api_football_status": api_football_status,
                        "espn_events": len(espn_index), "primary_events": len(primary_events),
-                       "clubelo_teams": len(elo), "odds_quotes": len(odds), "diagnostics": dict(getattr(self, "_source_diagnostics", {}))}
+                       "clubelo_teams": len(elo), "odds_quotes": len(odds),
+                       "api_football_prematch_events": fallback_stats["events"],
+                       "api_football_prematch_quotes": fallback_stats["quotes"],
+                       "market_reference_quotes": int(matched_count), "market_reference_events": int(priced_events),
+                       "diagnostics": dict(getattr(self, "_source_diagnostics", {}))}
             conn.execute("""INSERT INTO football_daily_runs VALUES(?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET fetched_at=excluded.fetched_at,
               status=excluded.status,source_summary=excluded.source_summary""",
@@ -291,7 +316,8 @@ class FootballModule:
                   VALUES(?,?,?,?,?,?,NULL)""",
                   (date_str, "valid", payload, attempted_at, market_observed_at, attempted_at))
             return {"date": date_str, "status": "valid", "snapshot_kind": "automatic",
-                    "updated_at": attempted_at, "events": len(rows), "member_visible": True}
+                    "updated_at": attempted_at, "events": len(rows), "member_visible": True,
+                    "market_status": run_metadata.get("market_status", "")}
         except Exception as exc:
             code, message = _auto_snapshot_diagnostic(exc)
             # Keep the prior valid payload intact.  A failed replacement is only
@@ -336,6 +362,7 @@ class FootballModule:
             events = conn.execute("SELECT event_id,league_key,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
             references = conn.execute("""SELECT event_id,market_type,side,line,price,observed_at
               FROM football_market_reference WHERE date_str=? ORDER BY event_id,observed_at""", (date_str,)).fetchall()
+            run = conn.execute("SELECT source_summary FROM football_daily_runs WHERE date_str=?", (date_str,)).fetchone()
         if not events:
             raise AutoSnapshotDiagnosticError("no_events", "當日查無可用足球賽事")
         reference_by_event: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
@@ -386,11 +413,13 @@ class FootballModule:
         if not rows:
             raise AutoSnapshotDiagnosticError("no_events", "當日查無可用足球賽事")
         metadata = self.get_run_metadata(date_str)
+        source_summary = _decode_source_summary(run["source_summary"] if run else None)
         metadata.update({
             "release_status": "automatic_available",
             "calibration_source": "自動更新／尚未人工校正",
             "updated_at": updated_at,
             "market_observed_at": market_observed_at,
+            "market_status": _automatic_market_status(source_summary, rows),
         })
         return rows, metadata, market_observed_at
 
@@ -556,6 +585,52 @@ class FootballModule:
             except Exception as exc:
                 self._source_diagnostics["盤口 " + league] = _provider_failure(exc)
         return out
+
+    def _fetch_api_football_prematch_odds(self, event: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Fetch saved pre-match odds only for an unmatched API-Football event.
+
+        This remains strictly inside the administrator refresh path.  ESPN
+        fallback rows have no API-Football fixture id, so they are never guessed
+        into another event.  Returned values go through the existing standard
+        market validation and the unchanged Asian/+EV calculation.
+        """
+
+        stats = getattr(self, "_api_football_odds_stats", None)
+        if not isinstance(stats, dict):
+            stats = self._api_football_odds_stats = {"attempted": 0, "events": 0, "quotes": 0}
+        if not self.config.api_football_key:
+            self._source_diagnostics.setdefault("API-Football 賽前盤", "未設定金鑰，無法補強未配對盤口")
+            return []
+        fixture_id = str(event.get("event_id") or "")
+        if str(event.get("api_source") or "") != "API-Football" or not fixture_id.isdigit():
+            return []
+        stats["attempted"] += 1
+        try:
+            response = requests.get(
+                f"{self.config.api_football_base}/odds",
+                headers={"x-apisports-key": self.config.api_football_key},
+                params={"fixture": fixture_id}, timeout=12,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, Mapping):
+                raise ValueError("invalid response")
+            if payload.get("errors"):
+                self._source_diagnostics["API-Football 賽前盤"] = "來源回應無可用賽前盤口或方案未開放"
+                return []
+            records = _api_football_prematch_records(event, payload)
+            if records:
+                stats["events"] += 1
+                stats["quotes"] += len(records)
+                self._source_diagnostics["API-Football 賽前盤"] = (
+                    f"未配對賽事補強成功 {stats['events']} 場／{stats['quotes']} 筆"
+                )
+            elif "API-Football 賽前盤" not in self._source_diagnostics:
+                self._source_diagnostics["API-Football 賽前盤"] = "未配對賽事尚未提供可驗證賽前盤口"
+            return records
+        except Exception as exc:
+            self._source_diagnostics["API-Football 賽前盤"] = _provider_failure(exc)
+            return []
 
     # -------------------------- Base Model: football only ---------------------
     def _build_base_model(self, event: Mapping[str, Any], elo: Mapping[str, float]) -> dict[str, Any]:
@@ -972,10 +1047,29 @@ def _sources_display(summary: Mapping[str, Any]) -> str:
         ("espn_events", "ESPN", "場"),
         ("clubelo_teams", "ClubElo", "隊"),
         ("odds_quotes", "The Odds API", "筆盤口"),
+        ("api_football_prematch_quotes", "API-Football 賽前盤", "筆"),
     )
     parts = [f"{label} {_number_display(summary[key])}{unit}" for key, label, unit in labels if key in summary]
     parts.extend(f"{name}：{message}" for name, message in summary.get("diagnostics", {}).items())
     return "｜".join(parts) if parts else "尚未儲存資料來源摘要"
+
+
+def _automatic_market_status(summary: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> str:
+    """Create a short, safe admin-only explanation of automatic market use."""
+
+    rows = list(rows)
+    market_events = int(summary.get("market_reference_events") or 0)
+    odds_quotes = int(summary.get("odds_quotes") or 0)
+    fallback_events = int(summary.get("api_football_prematch_events") or 0)
+    evaluated = sum(bool(row.get("market_evaluations")) for row in rows)
+    playable = sum(
+        1 for row in rows for item in row.get("market_evaluations", ())
+        if bool(item.get("playable"))
+    )
+    return (
+        f"足球盤口診斷：The Odds API {odds_quotes} 筆／API-Football 賽前盤補強 {fallback_events} 場／"
+        f"可用盤口 {market_events}/{len(rows)} 場／已運算 {evaluated} 場／達 +EV {playable} 筆"
+    )
 
 def _team_key(value: Any) -> str:
     key = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode().casefold())
@@ -1044,7 +1138,16 @@ def _consensus_event(league: str, event: Mapping[str, Any]) -> list[dict[str, An
             if not mt: continue
             for outcome in market.get("outcomes", []):
                 name = str(outcome.get("name", ""))
-                side = "over" if mt == "total" and name.casefold() == "over" else "under" if mt == "total" else "home" if name == home else "away" if name == away else "draw" if mt == "moneyline" and name.casefold() == "draw" else None
+                # Provider team labels can be abbreviated or accent-normalised.
+                # Use the same identity key as event matching so a real price is
+                # not discarded before it reaches the existing market validator.
+                side = (
+                    "over" if mt == "total" and name.casefold() == "over" else
+                    "under" if mt == "total" and name.casefold() == "under" else
+                    "home" if _team_key(name) == _team_key(home) else
+                    "away" if _team_key(name) == _team_key(away) else
+                    "draw" if mt == "moneyline" and name.casefold() == "draw" else None
+                )
                 if side and outcome.get("price") is not None:
                     buckets.setdefault((mt,side), []).append((outcome.get("point"), float(outcome["price"]), observed))
     rows = []
@@ -1055,6 +1158,163 @@ def _consensus_event(league: str, event: Mapping[str, Any]) -> list[dict[str, An
             "price": float(np.median(prices)), "provider": "The Odds API consensus",
             "observed_at": max(x[2] for x in values), "source_count": len(values)})
     return rows
+
+
+def _has_usable_market_records(records: Iterable[Mapping[str, Any]]) -> bool:
+    """Use the existing market validator to decide whether a fallback is needed."""
+
+    values = list(records)
+    if not values:
+        return False
+    try:
+        normalised = [_validate_market({
+            **dict(value),
+            "decimal_price": value.get("decimal_price", value.get("price")),
+        }) for value in values]
+        _validate_market_set(normalised)
+    except (TypeError, ValueError):
+        return False
+    return bool(normalised)
+
+
+def _api_football_prematch_records(event: Mapping[str, Any], payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Adapt API-Football's already-configured pre-match odds to normal rows.
+
+    No figure is inferred here.  A market is retained only when its sides form
+    a valid moneyline, Asian-handicap, or total pair.  The Football domain
+    module later applies its existing validator and Poisson/+EV calculation.
+    """
+
+    home, away = str(event.get("home") or ""), str(event.get("away") or "")
+    if not home or not away:
+        return []
+    buckets: dict[tuple[str, str, Optional[float]], list[tuple[float, str]]] = {}
+    for fixture in payload.get("response") or ():
+        if not isinstance(fixture, Mapping):
+            continue
+        observed = str(fixture.get("update") or _now())
+        for bookmaker in fixture.get("bookmakers") or ():
+            if not isinstance(bookmaker, Mapping):
+                continue
+            for bet in bookmaker.get("bets") or ():
+                if not isinstance(bet, Mapping):
+                    continue
+                market_type = _api_football_market_type(bet.get("name"))
+                if not market_type:
+                    continue
+                for outcome in bet.get("values") or ():
+                    if not isinstance(outcome, Mapping):
+                        continue
+                    parsed = _api_football_outcome(
+                        market_type, outcome.get("value"), home, away,
+                    )
+                    if parsed is None:
+                        continue
+                    side, line = parsed
+                    try:
+                        price = float(outcome.get("odd", outcome.get("price")))
+                    except (TypeError, ValueError):
+                        continue
+                    if price > 1:
+                        buckets.setdefault((market_type, side, line), []).append((price, observed))
+
+    def record(market_type: str, side: str, line: Optional[float]) -> Optional[dict[str, Any]]:
+        values = buckets.get((market_type, side, line), [])
+        if not values:
+            return None
+        prices, observed_times = zip(*values)
+        return {
+            "league": event.get("league_key"), "kickoff": event.get("kickoff"),
+            "home": home, "away": away, "market_type": market_type, "side": side,
+            "line": line, "price": float(np.median(prices)),
+            "provider": "API-Football pre-match odds", "observed_at": max(observed_times),
+            "source_count": len(values),
+        }
+
+    rows: list[dict[str, Any]] = []
+    # A standard 1X2 market can be calculated even when draw is not offered.
+    for side in ("home", "draw", "away"):
+        item = record("moneyline", side, None)
+        if item:
+            rows.append(item)
+
+    # Preserve a coherent Asian pair rather than combining unrelated lines from
+    # different bookmakers.  Pick the most frequently observed valid pair.
+    spread_pairs: list[tuple[int, float]] = []
+    for (market_type, side, line), values in buckets.items():
+        if market_type == "spread" and side == "home" and line is not None:
+            opposite = buckets.get(("spread", "away", -line), [])
+            if opposite:
+                spread_pairs.append((len(values) + len(opposite), line))
+    if spread_pairs:
+        _, line = max(spread_pairs, key=lambda item: (item[0], -abs(item[1])))
+        rows.extend(item for item in (record("spread", "home", line), record("spread", "away", -line)) if item)
+
+    total_pairs: list[tuple[int, float]] = []
+    for (market_type, side, line), values in buckets.items():
+        if market_type == "total" and side == "over" and line is not None:
+            opposite = buckets.get(("total", "under", line), [])
+            if opposite:
+                total_pairs.append((len(values) + len(opposite), line))
+    if total_pairs:
+        _, line = max(total_pairs, key=lambda item: (item[0], -item[1]))
+        rows.extend(item for item in (record("total", "over", line), record("total", "under", line)) if item)
+    return rows if _has_usable_market_records(rows) else []
+
+
+def _api_football_market_type(value: Any) -> Optional[str]:
+    name = re.sub(r"\s+", " ", str(value or "").casefold()).strip()
+    if any(token in name for token in ("asian handicap", "handicap")):
+        return "spread"
+    if any(token in name for token in ("over/under", "over under", "total goals", "goals over")):
+        return "total"
+    if name in {"match winner", "winner", "1x2", "match result", "result"}:
+        return "moneyline"
+    return None
+
+
+def _api_football_outcome(
+    market_type: str, value: Any, home: str, away: str,
+) -> Optional[tuple[str, Optional[float]]]:
+    text = str(value or "").strip()
+    folded = text.casefold()
+    if market_type == "moneyline":
+        if folded in {"1", "home", "home win"} or folded.startswith("home "):
+            return "home", None
+        if folded in {"x", "draw", "tie"}:
+            return "draw", None
+        if folded in {"2", "away", "away win"} or folded.startswith("away "):
+            return "away", None
+        team_key = _team_key(re.sub(r"[^A-Za-zÀ-ÿ .'-]", "", text))
+        if team_key == _team_key(home):
+            return "home", None
+        if team_key == _team_key(away):
+            return "away", None
+        return None
+    if market_type == "total":
+        side = "over" if folded.startswith("over") else "under" if folded.startswith("under") else ""
+        line = _api_football_line(text)
+        return (side, line) if side and line is not None else None
+    if market_type == "spread":
+        side = "home" if folded.startswith("home") else "away" if folded.startswith("away") else ""
+        if not side:
+            stripped = re.sub(r"[+-]?\d+(?:\.\d+)?", "", text)
+            key = _team_key(stripped)
+            side = "home" if key == _team_key(home) else "away" if key == _team_key(away) else ""
+        line = _api_football_line(text)
+        return (side, line) if side and line is not None else None
+    return None
+
+
+def _api_football_line(value: str) -> Optional[float]:
+    match = re.search(r"(?<![A-Za-z])([+-]?\d+(?:\.\d+)?)", str(value))
+    if not match:
+        return None
+    try:
+        line = float(match.group(1))
+    except ValueError:
+        return None
+    return line if math.isclose(line * 4, round(line * 4)) else None
 
 def _match_odds(records: Iterable[Mapping[str, Any]], event: Mapping[str, Any]) -> list[dict[str, Any]]:
     # Kept outside the class for testability; match on league, two teams, kickoff within 30 min.
@@ -1123,6 +1383,10 @@ _TEAM_ALIASES = {
     "bdortmund": "dortmund", "monchengladbach": "gladbach",
     "mgladbach": "gladbach", "psveindhoven": "psv",
     "rcdespanyol": "espanyol", "dalaves": "alaves",
+    "deportivo": "alaves", "deportivoalaves": "alaves", "alaves": "alaves",
+    "villarrealcf": "villarreal", "realvalladolid": "valladolid",
+    "parisfc": "parisfc", "olympiquelyonnais": "lyon",
+    "olympiquedemarseille": "marseille", "asroma": "roma",
 }
 
 def _provider_failure(exc):

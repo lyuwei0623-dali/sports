@@ -7,6 +7,7 @@ metadata. It never serialises the result object or displays raw error text.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping
 
 
@@ -85,6 +86,9 @@ def render_snapshot_result(st: Any, result: Mapping[str, Any] | None, sport: str
     )
     for column, (label, value) in zip(columns, labels_values):
         column.metric(label, value)
+    market_status = _safe_market_status(result.get("market_status"))
+    if market_status:
+        st.info(market_status)
     return summary
 
 
@@ -92,3 +96,17 @@ def _safe_scalar(value: Any) -> str:
     """Only scalar operation metadata can leave the Core admin boundary."""
 
     return str(value) if isinstance(value, (str, int, float, bool)) else "未提供"
+
+
+def _safe_market_status(value: Any) -> str:
+    """Allow a short, explicitly generated diagnostic—not raw provider data."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > 320:
+        return ""
+    # Provider payloads, URLs and credentials are never safe admin output.
+    if re.search(r"(?i)(api[_ -]?key|token|secret|https?://|\{|\}|\[|\])", text):
+        return ""
+    return text

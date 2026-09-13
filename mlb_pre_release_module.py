@@ -780,20 +780,35 @@ class TheOddsAPIClient:
 
     def __init__(self, http: Optional[HTTP] = None):
         self.http = http or HTTP()
+        # Fixed-shape diagnostics only.  They are used for a safe admin
+        # summary, never returned to members and never contain raw payloads.
+        self.last_diagnostics: dict[str, int] = {
+            "provider_events": 0,
+            "usable_events": 0,
+        }
 
     def fetch_mlb_markets(self, api_key: str) -> list[OddsMarket]:
         if not str(api_key).strip():
             raise ValueError("The Odds API key 不可為空")
+        # Keep the existing provider and conservative US default.  Operators
+        # with an eligible plan may widen this explicitly in Secrets without a
+        # code change; the API key is never exposed in UI output.
+        regions = os.environ.get("MLB_ODDS_REGIONS", "us").strip() or "us"
         raw = json.loads(self.http._read(THE_ODDS_API, {
             "apiKey": api_key,
-            "regions": "us",
+            "regions": regions,
             "markets": "h2h,spreads,totals",
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }).decode("utf-8"))
         if not isinstance(raw, list):
             raise ValueError("The Odds API MLB 回應必須是 JSON array")
-        return [market for event in raw if (market := _parse_odds_event(event)) is not None]
+        markets = [market for event in raw if (market := _parse_odds_event(event)) is not None]
+        self.last_diagnostics = {
+            "provider_events": len(raw),
+            "usable_events": len(markets),
+        }
+        return markets
 
 
 def _parse_odds_event(event: Any) -> Optional[OddsMarket]:
@@ -803,7 +818,7 @@ def _parse_odds_event(event: Any) -> Optional[OddsMarket]:
     commence = str(event.get("commence_time") or "")
     if not home or not away or not commence:
         return None
-    latest: dict[str, tuple[datetime, str, Mapping[str, Any]]] = {}
+    candidates: dict[str, list[tuple[datetime, str, Mapping[str, Any]]]] = {}
     for bookmaker in event.get("bookmakers") or ():
         if not isinstance(bookmaker, Mapping):
             continue
@@ -817,8 +832,16 @@ def _parse_odds_event(event: Any) -> Optional[OddsMarket]:
             except (TypeError, ValueError):
                 continue
             key = str(market["key"])
-            if key not in latest or parsed > latest[key][0]:
-                latest[key] = (parsed, book_name, market)
+            candidates.setdefault(key, []).append((parsed, book_name, market))
+    # The newest bookmaker update can sometimes contain only half a market.
+    # Select the newest *complete* market for each type instead of accepting a
+    # partial record that would make all automated recommendations disappear.
+    latest: dict[str, tuple[datetime, str, Mapping[str, Any]]] = {}
+    for key, values in candidates.items():
+        for candidate in sorted(values, key=lambda value: value[0], reverse=True):
+            if _complete_odds_market(key, candidate[2], home, away):
+                latest[key] = candidate
+                break
     if not latest:
         return None
     moneyline: dict[str, float] = {}
@@ -857,6 +880,44 @@ def _parse_odds_event(event: Any) -> Optional[OddsMarket]:
     market_times = {key: value[0].isoformat() for key, value in latest.items()}
     return OddsMarket(home, away, commence, books, newest.isoformat(), moneyline, spreads, totals,
                       market_times)
+
+
+def _complete_odds_market(key: str, market: Mapping[str, Any], home: str, away: str) -> bool:
+    """Ensure one automatic market can actually be calculated as a pair."""
+
+    values: dict[str, tuple[Optional[float], float]] = {}
+    for outcome in market.get("outcomes") or ():
+        if not isinstance(outcome, Mapping):
+            continue
+        name = str(outcome.get("name") or "")
+        side = (
+            "home" if _same_mlb_team(name, home) else
+            "away" if _same_mlb_team(name, away) else
+            "over" if key == "totals" and name.casefold() == "over" else
+            "under" if key == "totals" and name.casefold() == "under" else ""
+        )
+        if not side:
+            continue
+        try:
+            price = float(outcome["price"])
+            point = None if key == "h2h" else float(outcome["point"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if price > 1:
+            values[side] = (point, price)
+    if key == "h2h":
+        return {"home", "away"}.issubset(values)
+    if key == "spreads":
+        if not {"home", "away"}.issubset(values):
+            return False
+        home_line, away_line = values["home"][0], values["away"][0]
+        return home_line is not None and away_line is not None and math.isclose(home_line + away_line, 0)
+    if key == "totals":
+        if not {"over", "under"}.issubset(values):
+            return False
+        over, under = values["over"][0], values["under"][0]
+        return over is not None and under is not None and math.isclose(over, under)
+    return False
 
 
 def decide_automatic_market(
@@ -1283,9 +1344,12 @@ class MLBAutoSnapshotRunner:
             odds_markets = []
             odds_warning = "The Odds API：" + _mlb_failure_label(_mlb_source_failure(exc, "odds")) + "；保留 MLB 官方完整賽表並標示 PASS"
         try:
+            matched_markets = {
+                game.event_id: _match_odds_market(game, odds_markets)
+                for game in games
+            }
             decisions = {
-                game.event_id: decide_automatic_market(
-                    game, _match_odds_market(game, odds_markets), current)
+                game.event_id: decide_automatic_market(game, matched_markets[game.event_id], current)
                 for game in games
             }
             quotes = {game.event_id: _automatic_quotes(decisions[game.event_id]) for game in games}
@@ -1313,6 +1377,16 @@ class MLBAutoSnapshotRunner:
                     date_str, "no_games", "當日無可用 MLB 賽事", current)
             source_times = [decision.odds_updated_at for decision in decisions.values()
                             if decision.odds_updated_at]
+            provider_events = _diagnostic_count(
+                getattr(self.odds_client, "last_diagnostics", {}), "provider_events", len(odds_markets))
+            usable_events = _diagnostic_count(
+                getattr(self.odds_client, "last_diagnostics", {}), "usable_events", len(odds_markets))
+            matched_events = sum(market is not None for market in matched_markets.values())
+            calculable_events = sum(bool(quotes.get(game.event_id)) for game in games)
+            playable_count = sum(
+                1 for published in calculated for recommendation in getattr(published, "recommendations", ())
+                if recommendation.playable
+            )
         except Exception as exc:
             return self._failed_result(
                 date_str, "processing_failed",
@@ -1328,6 +1402,17 @@ class MLBAutoSnapshotRunner:
         result = _admin_snapshot_result(
             "automatic_available", current,
             int(saved.get("game_count", len(payloads))), True, None)
+        if odds_warning:
+            result["market_status"] = (
+                "MLB 盤口診斷：The Odds API 本次未提供可驗證盤口；"
+                "完整賽程已保存，請在「資料來源檢查」確認金鑰、額度與市場可用性。"
+            )
+        else:
+            result["market_status"] = (
+                f"MLB 盤口診斷：來源 {provider_events} 場／可用 {usable_events} 場／"
+                f"成功對應 {matched_events}/{len(games)} 場／可運算 {calculable_events} 場／"
+                f"達 +EV {playable_count} 筆"
+            )
         result["diagnostic_message"] = odds_warning or "MLB 官方賽程與盤口查詢已完成；未匹配場次請查看賽表警語。"
         return result
 
@@ -1372,6 +1457,15 @@ def _admin_snapshot_result(
     if error:
         result["error"] = error
     return result
+
+
+def _diagnostic_count(value: Any, key: str, default: int) -> int:
+    """Read a trusted scalar count without making diagnostics part of pricing."""
+
+    try:
+        return max(0, int(value.get(key, default))) if isinstance(value, Mapping) else max(0, int(default))
+    except (TypeError, ValueError):
+        return max(0, int(default))
 
 
 def _safe_admin_error(exc: Exception, odds_api_key: str) -> str:

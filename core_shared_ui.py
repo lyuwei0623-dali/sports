@@ -68,23 +68,34 @@ def shared_report_css() -> str:
 
     return """
     <style>
-      .core-report { margin: 0 0 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .core-report__title { margin: 0; padding: 10px 14px; color: #fff; background: linear-gradient(90deg, #0f172a, #334155); border-radius: 8px 8px 0 0; font-size: 15px; }
-      .core-report__scroll { overflow-x: auto; border: 1px solid #cbd5e1; border-top: 0; border-radius: 0 0 8px 8px; }
-      .core-report table { width: 100%; min-width: 760px; border-collapse: collapse; background: #fff; color: #172033; }
+      .core-report { margin: 0 0 22px; font-family: "Microsoft JhengHei", "Noto Sans TC", "PingFang TC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .01em; }
+      .core-report__title { margin: 0; padding: 12px 16px; color: #fff; background: linear-gradient(100deg, #0b1f3a, #1d4c78 68%, #a47d31); border-radius: 10px 10px 0 0; font-size: 16px; font-weight: 750; box-shadow: 0 4px 12px rgba(15, 23, 42, .14); }
+      .core-report__scroll { overflow-x: auto; border: 1px solid #d7e0ea; border-top: 0; border-radius: 0 0 10px 10px; box-shadow: 0 5px 16px rgba(15, 23, 42, .06); }
+      .core-report table { width: 100%; min-width: 760px; border-collapse: separate; border-spacing: 0; background: #fff; color: #172033; }
       .core-report[data-sport="football"] table { min-width: 1180px; }
       .core-report[data-sport="football"] td { vertical-align: top; }
       .core-report[data-sport="football"] td[data-label="市場盤口"] { min-width: 210px; }
       .core-report[data-sport="football"] td[data-label="資料風險／警語"] { min-width: 220px; }
-      .core-report__summary { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
-      .core-report th { padding: 9px 10px; background: #eaf0f7; border: 1px solid #cbd5e1; text-align: center; font-size: 13px; }
-      .core-report__group th { background: linear-gradient(90deg, #0f172a, #334155); color: #fff; text-align: left; letter-spacing: .2px; }
-      .core-report td { padding: 10px; border: 1px solid #e2e8f0; text-align: center; vertical-align: middle; font-size: 13px; overflow-wrap: anywhere; }
+      .core-report__summary { font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+      .core-report th { padding: 10px 11px; color: #183755; background: #eaf1f8; border-right: 1px solid #d7e0ea; border-bottom: 1px solid #cbd5e1; text-align: center; font-size: 13px; font-weight: 750; white-space: nowrap; }
+      .core-report th:last-child { border-right: 0; }
+      .core-report__group th { background: linear-gradient(90deg, #173a5e, #275d88); color: #fff; text-align: left; letter-spacing: .2px; }
+      .core-report td { padding: 11px 10px; border-right: 1px solid #e4ebf2; border-bottom: 1px solid #e4ebf2; text-align: center; vertical-align: middle; font-size: 13px; line-height: 1.58; overflow-wrap: anywhere; }
+      .core-report td:last-child { border-right: 0; }
+      .core-report tbody tr:last-child td { border-bottom: 0; }
       .core-report tbody tr:nth-child(even) td { background: #f8fafc; }
+      .core-report tbody tr:hover td { background: #f0f7ff; }
       .core-report .status-win td { background: #dcfce7 !important; }
       .core-report .status-push td { background: #fef3c7 !important; }
       .core-report .status-loss td { background: #fee2e2 !important; }
       .core-report .status-pending td { background: #f8fafc !important; }
+      .core-report .core-report__cell--recommendation,
+      .core-report .core-report__cell--moneyline,
+      .core-report .core-report__cell--spread,
+      .core-report .core-report__cell--total { font-weight: 650; }
+      .core-report .core-report__cell.is-positive { color: #087443; background: #ecfdf5 !important; }
+      .core-report .core-report__cell.is-pass { color: #9a5b10; background: #fffbeb !important; }
+      .core-report .core-report__cell.is-missing { color: #64748b; background: #f1f5f9 !important; }
       .core-report__badge { display: inline-block; padding: 2px 7px; border-radius: 99px; font-weight: 700; font-size: 12px; }
       .status-win .core-report__badge { background: #15803d; color: #fff; }
       .status-push .core-report__badge { background: #b45309; color: #fff; }
@@ -95,7 +106,7 @@ def shared_report_css() -> str:
       @media (max-width: 700px) {
         .core-report__scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
         .core-report table { min-width: 980px; }
-        .core-report th, .core-report td { padding: 8px 7px; font-size: 12px; }
+        .core-report th, .core-report td { padding: 9px 8px; font-size: 12px; }
         .core-report__title { position: sticky; left: 0; }
       }
     </style>
@@ -152,8 +163,16 @@ def _render_row(row: ReportRow, columns: Iterable[ReportColumn]) -> str:
     cells = []
     for column in columns:
         # Cell values are escaped because Core must not trust cross-module input.
-        value = escape(str(row.cells[column.key])).replace("\n", "<br>")
-        cells.append(f'<td data-label="{escape(column.label, quote=True)}">{value}</td>')
+        raw_value = str(row.cells[column.key])
+        value = escape(raw_value).replace("\n", "<br>")
+        cell_class = f"core-report__cell core-report__cell--{escape(column.key, quote=True)}"
+        if "無法評估" in raw_value or "未取得可用盤口" in raw_value:
+            cell_class += " is-missing"
+        elif "暫不推薦" in raw_value or "PASS" in raw_value:
+            cell_class += " is-pass"
+        elif "EV +" in raw_value or "EV＋" in raw_value:
+            cell_class += " is-positive"
+        cells.append(f'<td class="{cell_class}" data-label="{escape(column.label, quote=True)}">{value}</td>')
     if row.note:
         cells[-1] = cells[-1].replace("</td>", f'<span class="core-report__note">{escape(row.note)}</span></td>')
     if columns[-1].key == "settlement":
