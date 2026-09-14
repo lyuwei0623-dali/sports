@@ -1,6 +1,6 @@
-# 維大力體育APP V12
+# 維大力體育APP V13
 
-最新更新、上傳方式與驗收結果請先閱讀 V12_UPDATE.md。
+最新更新、上傳方式與驗收結果請先閱讀 V13_UPDATE.md。
 足球人工賠率現已改成不含本金水位，送入原模型前自動加 1；會員端仍顯示歐洲賠率。
 
 這是取代舊單一 `app.py` 的模組化版本。會員畫面提供三個功能：
@@ -23,6 +23,8 @@ V9 的頁首以 Streamlit 原生圖片元件顯示根目錄的 `logo.png`，並�
 ```toml
 APP_MEMBER_PASSWORD = "自行設定會員共用登入密碼"
 APP_ADMIN_PASSWORD = "自行設定管理員密碼"
+APP_PUBLIC_URL = "https://你的APP名稱.streamlit.app"
+APP_MEMBER_LINK_SECRET = "自行設定長且不公開的隨機文字"
 THE_ODDS_API_KEY = "The Odds API 金鑰"
 API_FOOTBALL_KEY = "API-Football 金鑰"
 FOOTBALL_SEASONS_JSON = '{"eng.1":2026,"esp.1":2026,"ger.1":2026,"ita.1":2026,"fra.1":2026,"uefa.champions":2026}'
@@ -57,7 +59,7 @@ FOOTBALL_ODDS_REGIONS = "eu"
 
 ### 會員專用連結
 
-後台「會員專用連結」請填入已部署的 APP 公開網址，例如 `https://你的app.streamlit.app`。系統會產生附帶 `?view=member` 的連結；會員開啟後只會看到會員密碼登入，管理員密碼無法從該入口進入後台。此連結不含密碼。
+在 Streamlit Secrets 一次設定 `APP_PUBLIC_URL` 與 `APP_MEMBER_LINK_SECRET` 後，後台只要輸入會員帳號即可產生專屬連結；不用重複輸入網址。系統會產生附帶 `?view=member` 與不可竄改簽章的連結；會員開啟後只會看到會員密碼登入，管理員密碼無法從該入口進入後台。連結不含密碼。
 
 ### MLB 自動盤口的原則
 

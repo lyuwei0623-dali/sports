@@ -13,15 +13,13 @@ rows saved by the daily backend refresh and administrator calibration step.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 import json
 import math
 import os
 import re
 import sqlite3
-import csv
 import unicodedata
-from io import StringIO
 from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
@@ -52,7 +50,7 @@ except ModuleNotFoundError:  # pragma: no cover - used only in minimal runtimes
 
 
 TZ_UTC = timezone.utc
-TZ_TAIPEI = timezone(timedelta(hours=8))
+FOOTBALL_MODEL_VERSION = "football-v2.1-quant-shadow"
 DEFAULT_LEAGUES = {
     "eng.1": 39, "esp.1": 140, "ger.1": 78,
     "ita.1": 135, "fra.1": 61, "uefa.champions": 2,
@@ -70,6 +68,7 @@ class FootballConfig:
     min_ev: float = 0.03
     simulations: int = 30000
     max_market_age_seconds: int = 900
+    v21_promoted: bool = False
 
 
 class AutoSnapshotDiagnosticError(RuntimeError):
@@ -85,6 +84,10 @@ class FootballModule:
 
     def __init__(self, config: FootballConfig) -> None:
         self.config = config
+        # Safe, operator-facing source status only.  Never store provider
+        # response bodies, URLs or exceptions here because they may contain
+        # credentials.
+        self._source_diagnostics: dict[str, str] = {}
         self._init_db()
 
     @classmethod
@@ -93,7 +96,6 @@ class FootballModule:
             db_path=db_path,
             api_football_key=os.environ.get("API_FOOTBALL_KEY", ""),
             odds_api_key=os.environ.get("THE_ODDS_API_KEY", ""),
-            odds_regions=os.environ.get("FOOTBALL_ODDS_REGIONS", "eu").strip() or "eu",
         ))
 
     def _db(self) -> sqlite3.Connection:
@@ -151,6 +153,19 @@ class FootballModule:
               updated_at TEXT, market_observed_at TEXT, attempted_at TEXT NOT NULL,
               error TEXT
             );
+            CREATE TABLE IF NOT EXISTS football_model_versions (
+              model_version TEXT PRIMARY KEY, training_cutoff TEXT, sources_json TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL, promoted INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS football_quant_shadow_predictions (
+              date_str TEXT NOT NULL, event_id TEXT NOT NULL, model_version TEXT NOT NULL,
+              forecast_json TEXT NOT NULL, created_at TEXT NOT NULL,
+              PRIMARY KEY(date_str,event_id,model_version)
+            );
+            CREATE TABLE IF NOT EXISTS football_quant_backtests (
+              model_version TEXT NOT NULL, training_cutoff TEXT NOT NULL, metrics_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, PRIMARY KEY(model_version,training_cutoff)
+            );
             CREATE INDEX IF NOT EXISTS football_automatic_snapshot_history_lookup
               ON football_automatic_snapshot_history(date_str, id DESC);
             -- Presentation audit metadata only.  This trigger records an
@@ -183,60 +198,44 @@ class FootballModule:
         ClubElo or The Odds API.  It may safely be retried; event rows are
         replaced atomically per date.  Member UI must never call this method.
         """
-        self._source_diagnostics = {}
-        self._api_football_odds_stats = {"attempted": 0, "events": 0, "quotes": 0}
         target = date.fromisoformat(date_str)
         espn_index = self._fetch_espn_fixtures(target)
         api_events: list[dict[str, Any]] = []
-        api_football_status = "not_configured"
-        valid_seasons = {
-            league: season for league, season in season_by_league.items()
-            if league in DEFAULT_LEAGUES and isinstance(season, int) and season >= 1900
-        }
+        diagnostics: list[dict[str, str]] = []
         if not self.config.api_football_key:
-            self._source_diagnostics["API-Football"] = "未設定金鑰，使用 ESPN 賽程"
-        elif not valid_seasons:
-            # ESPN remains a valid schedule source. A missing optional
-            # enrichment configuration must not turn a member-visible daily
-            # schedule into an application-wide failure.
-            self._source_diagnostics["API-Football"] = "未設定可用賽季，使用 ESPN 賽程"
-            api_football_status = "season_not_configured"
+            diagnostics.append({"code": "api_football_configuration_error", "message": "API-Football 金鑰未設定，改用 ESPN 賽程備援"})
+        elif not _has_configured_season(season_by_league):
+            diagnostics.append({"code": "league_season_configuration_error", "message": "聯賽或賽季設定不正確，改用 ESPN 賽程備援"})
         else:
             try:
-                api_events = self._fetch_api_football_fixtures(target, valid_seasons)
-                api_football_status = "ok" if api_events else "empty"
-            except Exception as exc:
-                self._source_diagnostics["API-Football"] = _provider_failure(exc)
-                # API-Football is enrichment.  A provider/key/quota problem must
-                # not erase an otherwise valid ESPN schedule.
-                api_football_status = "unavailable"
-        primary_events = list(api_events)
-        seen = {(e["league_key"], _team_key(e["home"]), _team_key(e["away"])) for e in api_events}
-        for event in self._espn_events_as_primary(espn_index):
-            identity = (event["league_key"], _team_key(event["home"]), _team_key(event["away"]))
-            if identity not in seen:
-                primary_events.append(event)
-                seen.add(identity)
+                api_events = self._fetch_api_football_fixtures(target, season_by_league)
+            except AutoSnapshotDiagnosticError as exc:
+                diagnostics.append({"code": exc.code, "message": f"{exc}: 改用 ESPN 賽程備援"})
+            except requests.RequestException:
+                diagnostics.append({"code": "external_api_error", "message": "API-Football 賽程暫時無法取得，改用 ESPN 賽程備援"})
         elo = self._fetch_clubelo(target)
-        odds = self._fetch_odds_consensus(target)
-        # The Odds API is used first.  If it has no internally valid market for
-        # an API-Football fixture, use that already configured provider's
-        # pre-match odds endpoint as a narrowly-scoped fallback.  This avoids
-        # replacing the Football model or inventing a price, and it avoids a
-        # second provider call for events that already have usable odds.
-        fallback_by_event: dict[str, list[dict[str, Any]]] = {}
-        for event in primary_events:
-            if _has_usable_market_records(_match_odds(odds, event)):
-                continue
-            fallback = self._fetch_api_football_prematch_odds(event)
-            if _has_usable_market_records(fallback):
-                fallback_by_event[str(event["event_id"])] = fallback
+        # A market-feed outage must never discard an otherwise valid schedule
+        # or model snapshot.  The source method itself isolates per-league
+        # failures; this second guard protects the daily refresh boundary.
+        try:
+            odds = self._fetch_odds_consensus(target)
+        except Exception:
+            odds = []
+            self._last_odds_diagnostics = [{"code": "odds_api_unavailable", "message": "即時盤口暫時無法取得；將保留賽程並顯示 PASS"}]
+        diagnostics.extend(getattr(self, "_last_odds_diagnostics", []))
+        events = api_events
+        if not events:
+            events = self._espn_fallback_events(espn_index)
+            if events:
+                diagnostics.append({"code": "espn_schedule_fallback", "message": "已使用 ESPN 賽程備援"})
+        status = "awaiting_manual_calibration" if events else ("failed" if diagnostics else "no_events")
         stored = 0
         with self._db() as conn:
             conn.execute("DELETE FROM football_events WHERE date_str=?", (date_str,))
             conn.execute("DELETE FROM football_market_reference WHERE date_str=?", (date_str,))
-            for event in primary_events:
-                event = self._merge_espn_backup(event, espn_index)
+            for event in events:
+                if event.get("schedule_source") != "ESPN":
+                    event = self._merge_espn_backup(event, espn_index)
                 event["elo_snapshot"] = {"home": elo.get(_team_key(event["home"]), 1650.0),
                                          "away": elo.get(_team_key(event["away"]), 1650.0)}
                 model = self._build_base_model(event, elo)
@@ -246,44 +245,22 @@ class FootballModule:
                     event["home"], event["away"], json.dumps(event, ensure_ascii=False),
                     json.dumps(model, ensure_ascii=False),
                 ))
-                matched = _match_odds(odds, event)
-                if not _has_usable_market_records(matched):
-                    matched = fallback_by_event.get(str(event["event_id"]), matched)
-                for q in matched:
+                for q in _match_odds(odds, event):
                     conn.execute("""INSERT INTO football_market_reference VALUES(?,?,?,?,?,?,?,?,?,?)""", (
                         date_str, event["event_id"], q["market_type"], q["side"], q["line"],
                         q["price"], q["provider"], q["observed_at"], q["source_count"],
                         json.dumps(q, ensure_ascii=False),
                     ))
                 stored += 1
-            matched_count = conn.execute("SELECT COUNT(*) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
-            priced_events = conn.execute("SELECT COUNT(DISTINCT event_id) FROM football_market_reference WHERE date_str=?", (date_str,)).fetchone()[0]
-            fallback_stats = dict(self._api_football_odds_stats)
-            self._source_diagnostics["盤口匹配"] = (
-                f"The Odds API {len(odds)} 筆；API-Football 賽前盤補強 {fallback_stats['events']} 場；"
-                f"可用盤口 {priced_events}/{len(primary_events)} 場"
-            )
-            unmatched = sorted({name for e in primary_events for name in (e["home"], e["away"]) if _team_key(name) not in elo})
-            if not elo:
-                self._source_diagnostics["ClubElo 匹配"] = "來源未取得評分，尚無法進行匹配"
-            elif not unmatched:
-                self._source_diagnostics["ClubElo 匹配"] = "當日賽程隊伍已完整匹配"
-            else:
-                self._source_diagnostics["ClubElo 匹配"] = (
-                    f"未對應 {len(unmatched)} 隊：" + "、".join(unmatched)
-                )
-            summary = {"api_football_events": len(api_events), "api_football_status": api_football_status,
-                       "espn_events": len(espn_index), "primary_events": len(primary_events),
-                       "clubelo_teams": len(elo), "odds_quotes": len(odds),
-                       "api_football_prematch_events": fallback_stats["events"],
-                       "api_football_prematch_quotes": fallback_stats["quotes"],
-                       "market_reference_quotes": int(matched_count), "market_reference_events": int(priced_events),
-                       "diagnostics": dict(getattr(self, "_source_diagnostics", {}))}
+            summary = {"api_football_events": len(api_events), "espn_events": len(espn_index),
+                       "stored_events": stored, "schedule_source": "API-Football" if api_events else ("ESPN" if events else None),
+                       "diagnostics": diagnostics, "clubelo_teams": len(elo), "odds_quotes": len(odds)}
             conn.execute("""INSERT INTO football_daily_runs VALUES(?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET fetched_at=excluded.fetched_at,
               status=excluded.status,source_summary=excluded.source_summary""",
-              (date_str, _now(), "awaiting_manual_calibration", json.dumps(summary)))
-        return {"date": date_str, "events": stored, "sources": summary}
+              (date_str, _now(), status, json.dumps(summary, ensure_ascii=False)))
+        return {"date": date_str, "events": stored, "status": "valid" if stored else status,
+                "sources": summary, "diagnostics": diagnostics}
 
     # ----------------------- backend automatic snapshot ----------------------
     def run_football_auto_snapshot(self, date_str: str, season_by_league: Mapping[str, int],
@@ -316,8 +293,7 @@ class FootballModule:
                   VALUES(?,?,?,?,?,?,NULL)""",
                   (date_str, "valid", payload, attempted_at, market_observed_at, attempted_at))
             return {"date": date_str, "status": "valid", "snapshot_kind": "automatic",
-                    "updated_at": attempted_at, "events": len(rows), "member_visible": True,
-                    "market_status": run_metadata.get("market_status", "")}
+                    "updated_at": attempted_at, "events": len(rows), "member_visible": True}
         except Exception as exc:
             code, message = _auto_snapshot_diagnostic(exc)
             # Keep the prior valid payload intact.  A failed replacement is only
@@ -359,10 +335,9 @@ class FootballModule:
     def _build_automatic_snapshot_payload(self, date_str: str, updated_at: str) -> tuple[list[dict[str, Any]], dict[str, Any], Optional[str]]:
         """Build a display payload from saved backend data and standard football markets."""
         with self._db() as conn:
-            events = conn.execute("SELECT event_id,league_key,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
+            events = conn.execute("SELECT event_id,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
             references = conn.execute("""SELECT event_id,market_type,side,line,price,observed_at
               FROM football_market_reference WHERE date_str=? ORDER BY event_id,observed_at""", (date_str,)).fetchall()
-            run = conn.execute("SELECT source_summary FROM football_daily_runs WHERE date_str=?", (date_str,)).fetchone()
         if not events:
             raise AutoSnapshotDiagnosticError("no_events", "當日查無可用足球賽事")
         reference_by_event: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
@@ -374,34 +349,36 @@ class FootballModule:
             market_observed_at = max(market_observed_at or "", item["observed_at"] or "") or market_observed_at
 
         rows: list[dict[str, Any]] = []
+        shadow_records: list[tuple[str, str]] = []
         for event in events:
             markets = list(reference_by_event.get(event["event_id"], {}).values())
-            normalised: list[dict[str, Any]] = []
-            market_warning = ""
-            if markets:
-                try:
-                    normalised = [_validate_market(market) for market in markets]
-                    _validate_market_set(normalised)
-                except (TypeError, ValueError):
-                    normalised = []
-                    market_warning = "自動盤口格式不完整，本場先保留賽程並標示 PASS"
-            else:
-                market_warning = "尚未取得可用盤口，本場先保留賽程並標示 PASS"
             model = json.loads(event["model_json"])
-            recommendations = self._calculate_recommendations(model, normalised) if normalised else []
+            normalised = [_validate_market(market) for market in markets]
+            if normalised:
+                _validate_market_set(normalised)
+                v21_recommendations = self._calculate_recommendations(model, normalised)
+                recommendations = v21_recommendations if self.config.v21_promoted else self._calculate_legacy_recommendations(model, normalised)
+            else:
+                # No price means no implied probability, fusion, or +EV.  An
+                # empty recommendation list is the existing Core-compatible
+                # PASS representation; no synthetic market is introduced.
+                v21_recommendations, recommendations = [], []
+            forecast = _quant_forecast(model, matrix=_score_matrix(float(model["lambda_home"]), float(model["lambda_away"]), rho=-0.08), recommendations=v21_recommendations)
             risk = model.get("risk", {})
             row = {
-                "event_id": event["event_id"], "league_key": event["league_key"], "forecast": _saved_forecast(model), "sport": "football", "kickoff": event["kickoff"],
+                "event_id": event["event_id"], "sport": "football", "kickoff": event["kickoff"],
                 "home": event["home_team"], "away": event["away_team"], "model": model,
                 "risk": _risk_display(risk), "risk_display": _risk_display(risk),
-                "warning": _join_warning("自動更新／尚未人工校正", market_warning, _risk_warning(risk)),
+                "warning": _join_warning("自動更新／尚未人工校正", _risk_warning(risk),
+                    None if normalised else "即時盤口暫時無法取得：PASS（無有效可驗證價格）"),
                 "settlement_status": "pending",
-                "first_market": _markets_display(normalised, event["home_team"], event["away_team"])
-                                if normalised else "自動盤口未取得",
-                "latest_market": _markets_display(normalised, event["home_team"], event["away_team"])
-                                 if normalised else "自動盤口未取得",
-                "market_change": "自動快照盤口（尚無人工校正歷程）",
-                "market_evaluations": recommendations,
+                "first_market": _markets_display(normalised, event["home_team"], event["away_team"]) if normalised else "尚無可驗證即時盤口",
+                "latest_market": _markets_display(normalised, event["home_team"], event["away_team"]) if normalised else "尚無可驗證即時盤口",
+                "market_change": "自動快照盤口（尚無人工校正歷程）" if normalised else "無可用盤口，推薦為 PASS",
+                # ``forecast`` is the long-standing Core contract.  The
+                # richer V2.1 audit payload below must never replace it.
+                "forecast": _saved_forecast(model, forecast),
+                "quant_forecast": forecast,
                 "recommendations": [],
             }
             for recommendation in recommendations:
@@ -410,40 +387,83 @@ class FootballModule:
                 display = _market_selection_display(recommendation, event["home_team"], event["away_team"])
                 row["recommendations"].append({**recommendation, "display": display, "selection": display})
             rows.append(row)
+            shadow_records.append((event["event_id"], json.dumps(forecast, ensure_ascii=False)))
         if not rows:
             raise AutoSnapshotDiagnosticError("no_events", "當日查無可用足球賽事")
         metadata = self.get_run_metadata(date_str)
-        source_summary = _decode_source_summary(run["source_summary"] if run else None)
         metadata.update({
             "release_status": "automatic_available",
             "calibration_source": "自動更新／尚未人工校正",
             "updated_at": updated_at,
             "market_observed_at": market_observed_at,
-            "market_status": _automatic_market_status(source_summary, rows),
+            "model_version": FOOTBALL_MODEL_VERSION,
+            "model_mode": "shadow" if not self.config.v21_promoted else "promoted",
         })
+        with self._db() as conn:
+            conn.execute("""INSERT INTO football_model_versions VALUES(?,?,?,?,?,?)
+              ON CONFLICT(model_version) DO UPDATE SET sources_json=excluded.sources_json,
+                promoted=excluded.promoted,created_at=excluded.created_at""",
+                (FOOTBALL_MODEL_VERSION, None, json.dumps(["API-Football", "ESPN", "ClubElo", "The Odds API"]),
+                 json.dumps({"status": "shadow_pending_backtest"}), int(self.config.v21_promoted), updated_at))
+            for event_id, forecast_json in shadow_records:
+                conn.execute("""INSERT INTO football_quant_shadow_predictions VALUES(?,?,?,?,?)
+                  ON CONFLICT(date_str,event_id,model_version) DO UPDATE SET forecast_json=excluded.forecast_json,created_at=excluded.created_at""",
+                    (date_str, event_id, FOOTBALL_MODEL_VERSION, forecast_json, updated_at))
         return rows, metadata, market_observed_at
+
+    def run_quant_backtest(self, records: Iterable[Mapping[str, Any]], training_cutoff: str) -> dict[str, Any]:
+        """Time-ordered V2.1 evaluation; caller supplies only pre-match records.
+
+        Each record must include ``pre_match_at``, the saved pre-match ``model``,
+        and final ``home_goals``/``away_goals``.  Rows at or after the cutoff are
+        evaluated only; future outcomes are never used to alter their forecast.
+        """
+        cutoff = _parse_timestamp(training_cutoff)
+        if cutoff is None: raise ValueError("training_cutoff must be ISO-8601")
+        evaluated = []
+        for record in sorted(records, key=lambda item: str(item.get("pre_match_at", ""))):
+            when = _parse_timestamp(record.get("pre_match_at"))
+            if when is None or when < cutoff: continue
+            model = record.get("model") or {}
+            if "lambda_home" not in model or "lambda_away" not in model: continue
+            matrix = _score_matrix(float(model["lambda_home"]), float(model["lambda_away"]), rho=-0.08)
+            home_goals, away_goals = int(record["home_goals"]), int(record["away_goals"])
+            mode = _matrix_mode(matrix)
+            probabilities = [float(matrix[np.indices(matrix.shape)[0] > np.indices(matrix.shape)[1]].sum()),
+                             float(np.trace(matrix)), float(matrix[np.indices(matrix.shape)[0] < np.indices(matrix.shape)[1]].sum())]
+            actual = 0 if home_goals > away_goals else 1 if home_goals == away_goals else 2
+            evaluated.append({"probabilities": probabilities, "actual": actual, "home": home_goals, "away": away_goals,
+                              "lambda_home": float(model["lambda_home"]), "lambda_away": float(model["lambda_away"]), "mode": mode})
+        if not evaluated: raise ValueError("no post-cutoff pre-match records available for backtest")
+        log_loss = float(np.mean([-math.log(max(.001, row["probabilities"][row["actual"]])) for row in evaluated]))
+        brier = float(np.mean([sum((prob - float(index == row["actual"])) ** 2 for index, prob in enumerate(row["probabilities"])) for row in evaluated]))
+        metrics = {"period_start": training_cutoff, "samples": len(evaluated), "one_x_two": {"log_loss": log_loss, "brier_score": brier},
+                   "expected_goals": {"mae": float(np.mean([abs(row["lambda_home"]-row["home"]) + abs(row["lambda_away"]-row["away"]) for row in evaluated]) / 2),
+                                      "rmse": float(math.sqrt(np.mean([(row["lambda_home"]-row["home"])**2 + (row["lambda_away"]-row["away"])**2 for row in evaluated]) / 2))},
+                   "correct_score": {"top_1": float(np.mean([row["mode"] == (row["home"], row["away"]) for row in evaluated]))},
+                   "calibration_summary": "時間序列 holdout；完整曲線需在樣本足夠後產生", "status": "shadow_evaluation"}
+        with self._db() as conn:
+            conn.execute("INSERT INTO football_quant_backtests VALUES(?,?,?,?) ON CONFLICT(model_version,training_cutoff) DO UPDATE SET metrics_json=excluded.metrics_json,created_at=excluded.created_at",
+                         (FOOTBALL_MODEL_VERSION, training_cutoff, json.dumps(metrics, ensure_ascii=False), _now()))
+        return metrics
 
     def _fetch_api_football_fixtures(self, target: date, seasons: Mapping[str, int]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         headers = {"x-apisports-key": self.config.api_football_key}
+        attempted, failures = 0, 0
         for league_key, league_id in DEFAULT_LEAGUES.items():
             season = seasons.get(league_key)
             if not season:
                 continue
-            response = requests.get(f"{self.config.api_football_base}/fixtures", headers=headers,
-                params={"league": league_id, "season": season, "date": target.isoformat(), "timezone": "Asia/Taipei"}, timeout=12)
-            response.raise_for_status()
-            body = response.json()
-            if body.get("errors"):
-                errors = body["errors"]
-                codes = set(errors) if isinstance(errors, dict) else set()
-                reason = ("API-Football 額度或請求速率限制" if codes & {"rateLimit", "requests"} else
-                          "API-Football 方案、認證或賽季參數遭拒")
-                if not hasattr(self, "_source_diagnostics"):
-                    self._source_diagnostics = {}
-                self._source_diagnostics["API-Football " + league_key] = reason
-                continue
-            for item in body.get("response", []):
+            attempted += 1
+            try:
+                response = requests.get(f"{self.config.api_football_base}/fixtures", headers=headers,
+                    params={"league": league_id, "season": season, "date": target.isoformat()}, timeout=12)
+                response.raise_for_status()
+            except requests.RequestException:
+                failures += 1
+                continue  # A single league outage must not block other leagues or MLB.
+            for item in response.json().get("response", []):
                 fixture = item.get("fixture", {})
                 teams = item.get("teams", {})
                 if not fixture.get("id") or not teams.get("home", {}).get("name"):
@@ -461,33 +481,8 @@ class FootballModule:
                     "status": fixture.get("status", {}).get("short", "NS"),
                     "team_statistics": team_stats, "injuries": injuries, "lineups": lineups,
                     "api_source": "API-Football"})
-        return out
-
-    def _espn_events_as_primary(
-        self, espn_index: Mapping[tuple[str, str], Mapping[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Turn the existing ESPN verification feed into a schedule fallback."""
-        out: list[dict[str, Any]] = []
-        for event in espn_index.values():
-            competition = (event.get("competitions") or [{}])[0]
-            competitors = competition.get("competitors") or []
-            by_side = {item.get("homeAway"): item for item in competitors}
-            home = by_side.get("home", {}).get("team", {})
-            away = by_side.get("away", {}).get("team", {})
-            if not event.get("id") or not home.get("name") or not away.get("name"):
-                continue
-            league_key = str(event.get("_league_key") or "football")
-            out.append({
-                "event_id": f"espn:{league_key}:{event['id']}",
-                "league_key": league_key,
-                "kickoff": event.get("date") or competition.get("date"),
-                "home": home["name"], "away": away["name"],
-                "home_id": home.get("id"), "away_id": away.get("id"),
-                "status": ((event.get("status") or {}).get("type") or {}).get("state", "pre"),
-                "team_statistics": {"home": {}, "away": {}},
-                "injuries": [], "lineups": [], "api_source": "ESPN fallback",
-                "espn_verified": True,
-            })
+        if attempted and attempted == failures:
+            raise AutoSnapshotDiagnosticError("external_api_error", "外部足球賽程資料暫時無法取得")
         return out
 
     def _fetch_team_statistics(self, headers: Mapping[str, str], league: int, season: int,
@@ -524,45 +519,70 @@ class FootballModule:
         for league_key in DEFAULT_LEAGUES:
             try:
                 url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_key}/scoreboard"
-                r = requests.get(url, params={"dates": (target-timedelta(days=1)).strftime("%Y%m%d") + "-" + target.strftime("%Y%m%d"), "limit": 100}, timeout=8)
-                r.raise_for_status()
+                r = requests.get(url, params={"dates": target.strftime("%Y%m%d"), "limit": 100}, timeout=8)
                 for event in r.json().get("events", []) if r.ok else []:
-                    if _local_date(event.get("date")) != target.isoformat():
-                        continue
                     comp = (event.get("competitions") or [{}])[0]
                     names = {c.get("homeAway"): c.get("team", {}).get("name", "") for c in comp.get("competitors", [])}
                     if names.get("home") and names.get("away"):
-                        saved = dict(event)
-                        saved["_league_key"] = league_key
-                        out[(_team_key(names["home"]), _team_key(names["away"]))] = saved
-            except Exception as exc:
-                if not hasattr(self, "_source_diagnostics"):
-                    self._source_diagnostics = {}
-                self._source_diagnostics["ESPN " + league_key] = _provider_failure(exc)
+                        # Store the ESPN league key with the event so it can
+                        # become a complete fallback event when API-Football
+                        # is unavailable.  No raw provider payload is exposed.
+                        saved_event = dict(event)
+                        saved_event["_football_league_key"] = league_key
+                        out[(_team_key(names["home"]), _team_key(names["away"]))] = saved_event
+            except requests.RequestException:
                 continue
         return out
 
+    def _espn_fallback_events(self, espn_index: Mapping[tuple[str, str], Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Convert saved ESPN schedule entries into safe Football event rows.
+
+        ESPN is used only for fixture identity/venue/time in this path.  It
+        deliberately supplies no invented team statistics, xG, injuries or
+        line-ups; the base model will record its normal fallback-quality flags.
+        """
+        events: list[dict[str, Any]] = []
+        for raw in espn_index.values():
+            competition = (raw.get("competitions") or [{}])[0]
+            competitors = competition.get("competitors") or []
+            teams = {item.get("homeAway"): item.get("team", {}) for item in competitors}
+            home, away = teams.get("home", {}).get("name"), teams.get("away", {}).get("name")
+            if not home or not away:
+                continue
+            espn_id = str(raw.get("id") or competition.get("id") or "")
+            if not espn_id:
+                continue
+            events.append({
+                "event_id": f"espn:{espn_id}", "league_key": raw.get("_football_league_key", "eng.1"),
+                "kickoff": raw.get("date") or competition.get("date"), "home": home, "away": away,
+                "home_id": None, "away_id": None, "status": raw.get("status", {}).get("type", {}).get("shortDetail", "NS"),
+                "team_statistics": {"home": {}, "away": {}}, "injuries": [], "lineups": [],
+                "api_source": "ESPN", "schedule_source": "ESPN", "espn_verified": True,
+                "espn_event_id": espn_id,
+            })
+        return events
+
     def _fetch_clubelo(self, target: date) -> dict[str, float]:
-        # Do not request a future rating snapshot. Never label fallback ratings current.
-        rating_day = min(target, datetime.now(TZ_TAIPEI).date())
-        if not hasattr(self, "_source_diagnostics"):
-            self._source_diagnostics = {}
         try:
-            r = requests.get(f"https://api.clubelo.com/{rating_day.isoformat()}", timeout=15)
+            r = requests.get(f"https://api.clubelo.com/{target.isoformat()}", timeout=10)
             r.raise_for_status()
-            records = list(csv.DictReader(StringIO(r.text.lstrip("\ufeff"))))
-            ratings = {_team_key(row["Club"]): float(row["Elo"]) for row in records}
-            self._source_diagnostics["ClubElo"] = f"評分日期 {rating_day}，取得 {len(ratings)} 隊"
-            return ratings
-        except Exception as exc:
-            self._source_diagnostics["ClubElo"] = _provider_failure(exc)
+            rows = r.text.splitlines()
+            headings = rows[0].split(",")
+            club_i, elo_i = headings.index("Club"), headings.index("Elo")
+            return {_team_key(line.split(",")[club_i]): float(line.split(",")[elo_i]) for line in rows[1:] if "," in line}
+        except (requests.RequestException, ValueError, IndexError):
             return {}
 
     def _fetch_odds_consensus(self, target: date) -> list[dict[str, Any]]:
-        if not hasattr(self, "_source_diagnostics"):
-            self._source_diagnostics = {}
+        """Fetch standard pre-match markets without allowing a feed failure to escape.
+
+        A provider exception is retained as a short diagnostic only; no key,
+        URL, response body, or provider exception text is persisted/displayed.
+        """
+        self._last_odds_diagnostics: list[dict[str, str]] = []
         if not self.config.odds_api_key:
-            self._source_diagnostics["The Odds API"] = "未設定金鑰"
+            self._last_odds_diagnostics.append({"code": "odds_api_configuration_error", "message": "The Odds API 未設定；將保留賽程並顯示 PASS"})
+            self._source_diagnostics["The Odds API"] = "未設定金鑰；無有效盤口的賽事將顯示 PASS"
             return []
         keys = {"eng.1": "soccer_epl", "esp.1": "soccer_spain_la_liga", "ger.1": "soccer_germany_bundesliga",
                 "ita.1": "soccer_italy_serie_a", "fra.1": "soccer_france_ligue_one", "uefa.champions": "soccer_uefa_champs_league"}
@@ -573,88 +593,61 @@ class FootballModule:
                     "apiKey": self.config.odds_api_key, "regions": self.config.odds_regions,
                     "markets": "h2h,spreads,totals", "oddsFormat": "decimal", "dateFormat": "iso"}, timeout=12)
                 r.raise_for_status()
-                events = r.json()
-                if not isinstance(events, list):
-                    raise ValueError("invalid response")
-                before = len(out)
-                for event in events:
+                for event in r.json():
                     if _local_date(event.get("commence_time")) != target.isoformat():
                         continue
                     out.extend(_consensus_event(league, event))
-                self._source_diagnostics["盤口 " + league] = f"API 成功 {len(events)} 場；目標台灣日期 {len(out)-before} 筆盤口"
             except Exception as exc:
-                self._source_diagnostics["盤口 " + league] = _provider_failure(exc)
+                self._last_odds_diagnostics.append({"code": "odds_api_unavailable", "message": "部分即時盤口暫時無法取得；無有效價格的賽事將顯示 PASS"})
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code in {401, 403}:
+                    self._source_diagnostics["The Odds API"] = "認證或存取權限失敗，請檢查 The Odds API 金鑰與方案"
+                else:
+                    self._source_diagnostics["The Odds API"] = "部分即時盤口暫時無法取得；無有效價格的賽事將顯示 PASS"
+                continue
         return out
-
-    def _fetch_api_football_prematch_odds(self, event: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Fetch saved pre-match odds only for an unmatched API-Football event.
-
-        This remains strictly inside the administrator refresh path.  ESPN
-        fallback rows have no API-Football fixture id, so they are never guessed
-        into another event.  Returned values go through the existing standard
-        market validation and the unchanged Asian/+EV calculation.
-        """
-
-        stats = getattr(self, "_api_football_odds_stats", None)
-        if not isinstance(stats, dict):
-            stats = self._api_football_odds_stats = {"attempted": 0, "events": 0, "quotes": 0}
-        if not self.config.api_football_key:
-            self._source_diagnostics.setdefault("API-Football 賽前盤", "未設定金鑰，無法補強未配對盤口")
-            return []
-        fixture_id = str(event.get("event_id") or "")
-        if str(event.get("api_source") or "") != "API-Football" or not fixture_id.isdigit():
-            return []
-        stats["attempted"] += 1
-        try:
-            response = requests.get(
-                f"{self.config.api_football_base}/odds",
-                headers={"x-apisports-key": self.config.api_football_key},
-                params={"fixture": fixture_id}, timeout=12,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, Mapping):
-                raise ValueError("invalid response")
-            if payload.get("errors"):
-                self._source_diagnostics["API-Football 賽前盤"] = "來源回應無可用賽前盤口或方案未開放"
-                return []
-            records = _api_football_prematch_records(event, payload)
-            if records:
-                stats["events"] += 1
-                stats["quotes"] += len(records)
-                self._source_diagnostics["API-Football 賽前盤"] = (
-                    f"未配對賽事補強成功 {stats['events']} 場／{stats['quotes']} 筆"
-                )
-            elif "API-Football 賽前盤" not in self._source_diagnostics:
-                self._source_diagnostics["API-Football 賽前盤"] = "未配對賽事尚未提供可驗證賽前盤口"
-            return records
-        except Exception as exc:
-            self._source_diagnostics["API-Football 賽前盤"] = _provider_failure(exc)
-            return []
 
     # -------------------------- Base Model: football only ---------------------
     def _build_base_model(self, event: Mapping[str, Any], elo: Mapping[str, float]) -> dict[str, Any]:
         home_stats = event.get("team_statistics", {}).get("home", {})
         away_stats = event.get("team_statistics", {}).get("away", {})
-        home_attack, home_defence = _team_rates(home_stats, "home")
-        away_attack, away_defence = _team_rates(away_stats, "away")
+        home_attack, home_defence, home_quality = _team_rates_with_quality(home_stats, "home")
+        away_attack, away_defence, away_quality = _team_rates_with_quality(away_stats, "away")
         league_home, league_away = _league_goal_prior(event["league_key"])
         home_elo = elo.get(_team_key(event["home"]), 1650.0)
         away_elo = elo.get(_team_key(event["away"]), 1650.0)
         elo_adjust = max(.80, min(1.20, 1.0 + (home_elo - away_elo) / 2200.0))
         home_injuries = _injury_count(event.get("injuries", []), event.get("home"))
         away_injuries = _injury_count(event.get("injuries", []), event.get("away"))
-        # xG rates are preferred; goals are a bounded fallback.  Injuries are a
-        # small risk adjustment until confirmed lineups can replace them.
-        lh = max(.25, math.sqrt(home_attack * away_defence) * league_home * elo_adjust * (1 - .035 * home_injuries))
-        la = max(.20, math.sqrt(away_attack * home_defence) * league_away / elo_adjust * (1 - .035 * away_injuries))
-        quality = {"home_stats": bool(home_stats), "away_stats": bool(away_stats),
-                   "clubelo": _team_key(event["home"]) in elo and _team_key(event["away"]) in elo,
-                   "injury_count": {"home": home_injuries, "away": away_injuries}}
-        return {"lambda_home": round(lh, 4), "lambda_away": round(la, 4),
-                "projected_total": round(lh + la, 4), "quality": quality,
-                "risk": _assess_risk(event, quality),
-                "notes": "API-Football form/statistics + ClubElo; market data excluded from Base Model"}
+        # Current feeds do not provide verified shot-event xG.  These are model
+        # expected goals, using venue rates with explicit shrinkage to league priors.
+        home_attack = _shrink_rate(home_attack, league_home, home_quality["shrinkage"])
+        away_attack = _shrink_rate(away_attack, league_away, away_quality["shrinkage"])
+        home_defence = _shrink_rate(home_defence, league_away, home_quality["shrinkage"])
+        away_defence = _shrink_rate(away_defence, league_home, away_quality["shrinkage"])
+        lh = max(.25, league_home * math.sqrt((home_attack / league_home) * (away_defence / league_home)) * elo_adjust * (1 - .035 * home_injuries))
+        la = max(.20, league_away * math.sqrt((away_attack / league_away) * (home_defence / league_away)) / elo_adjust * (1 - .035 * away_injuries))
+        clubelo_matched = _team_key(event["home"]) in elo and _team_key(event["away"]) in elo
+        lineups_confirmed = _has_confirmed_lineups(event)
+        fallback_reasons = list(home_quality["fallback_reason"]) + list(away_quality["fallback_reason"])
+        if not clubelo_matched:
+            fallback_reasons.append("ClubElo 未匹配：使用中性強度值")
+        quality = {"home_stats": bool(home_stats), "away_stats": bool(away_stats), "clubelo": clubelo_matched,
+                   "injury_count": {"home": home_injuries, "away": away_injuries},
+                   "teams": {"home": home_quality, "away": away_quality},
+                   "lineups_confirmed": lineups_confirmed, "fallback_reason": fallback_reasons,
+                   "confidence": _model_confidence(home_quality, away_quality, clubelo_matched, lineups_confirmed)}
+        matrix = _score_matrix(lh, la, rho=-0.08)
+        exact_home, exact_away = _matrix_mode(matrix)
+        return {"model_version": FOOTBALL_MODEL_VERSION,
+                "lambda_home": round(lh, 4), "lambda_away": round(la, 4),
+                "model_lambda_home": round(lh, 4), "model_lambda_away": round(la, 4),
+                "expected_goals_conceded_home": round(la, 4), "expected_goals_conceded_away": round(lh, 4),
+                "goal_semantics": "模型預估進球（非 shot-based 資料 xG）",
+                "projected_total": round(lh + la, 4), "exact_score_mode": f"{exact_home}:{exact_away}",
+                "score_distribution_method": "Dixon-Coles adjusted Poisson joint score matrix",
+                "quality": quality, "risk": _assess_risk(event, quality),
+                "notes": "V2.1：API-Football/ClubElo 賽前資料；未取得可驗證 shot-based xG 時使用進球/失球備援"}
 
     def refresh_fixture_readiness(self, date_str: str, event_id: str) -> dict[str, Any]:
         """Protected pre-release check for confirmation of lineups/injuries.
@@ -719,7 +712,7 @@ class FootballModule:
                     date_str, str(event_id), m["market_type"], m["side"], m.get("line"),
                     m["decimal_price"], source, _now()))
             model = json.loads(row["model_json"])
-        results = self._calculate_recommendations(model, normalised)
+        results = self._calculate_recommendations(model, normalised) if self.config.v21_promoted else self._calculate_legacy_recommendations(model, normalised)
         with self._db() as conn:
             conn.execute("DELETE FROM football_recommendations WHERE date_str=? AND event_id=?", (date_str, str(event_id)))
             for r in results:
@@ -742,10 +735,7 @@ class FootballModule:
             conn.execute("UPDATE football_daily_runs SET status='published' WHERE date_str=?", (date_str,))
         # A published manual payload is immutable from the auto-snapshot path.
         # It is display persistence only; no model or market logic is changed.
-        published_rows = self.get_published_rows(date_str)
-        for row in published_rows:
-            row["forecast"] = _saved_forecast(row["model"])
-        payload = json.dumps({"rows": published_rows, "run_metadata": self.get_run_metadata(date_str)}, ensure_ascii=False)
+        payload = json.dumps({"rows": self.get_published_rows(date_str), "run_metadata": self.get_run_metadata(date_str)}, ensure_ascii=False)
         with self._db() as conn:
             conn.execute("""INSERT INTO football_manual_snapshots VALUES(?,?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET payload_json=excluded.payload_json,
@@ -753,34 +743,63 @@ class FootballModule:
                 (date_str, payload, now, note, now))
 
     def _calculate_recommendations(self, model: Mapping[str, Any], markets: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        saved_markets = [dict(m) for m in markets]
+        matrix = _score_matrix(float(model["lambda_home"]), float(model["lambda_away"]), rho=-0.08)
+        market_probabilities = _devig_market_probabilities(saved_markets)
+        confidence = float(model.get("quality", {}).get("confidence", .35))
+        results = []
+        for m in saved_markets:
+            raw_probability, raw_ev = _matrix_market_value(matrix, m)
+            key = _market_key(m)
+            market_probability = market_probabilities.get(key)
+            if market_probability is None:
+                final_probability, model_weight, market_weight = raw_probability, 1.0, 0.0
+                fusion_reason = "缺少可去水的對應市場價格；僅保存模型機率，PASS"
+                final_ev = None
+            else:
+                model_weight = _fusion_model_weight(confidence, model.get("quality", {}))
+                market_weight = 1.0 - model_weight
+                final_probability = _logit_blend(raw_probability, market_probability, model_weight)
+                # Preserve the existing Asian settlement payoff protection, then
+                # adjust only for the fused selection probability delta.
+                final_ev = raw_ev + (final_probability - raw_probability) * float(m["decimal_price"])
+                fusion_reason = _fusion_reason(model_weight, model.get("quality", {}))
+            playable = bool(final_ev is not None and final_ev >= self.config.min_ev and market_probability is not None)
+            results.append({**m, "model_probability": raw_probability, "raw_model_probability": raw_probability,
+                            "de_vig_market_probability": market_probability, "final_probability": final_probability,
+                            "model_weight": model_weight, "market_weight": market_weight,
+                            "fair_decimal_odds": 1 / final_probability if final_probability else None,
+                            "final_ev": final_ev, "fusion_reason": fusion_reason,
+                            "implied_probability": 1 / m["decimal_price"], "ev": final_ev,
+                            "playable": playable, "label": "可推薦" if playable else "PASS｜未達融合 +EV 門檻或市場不完整"})
+        return results
+
+    def _calculate_legacy_recommendations(self, model: Mapping[str, Any], markets: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Frozen V2.0 recommendation path used while V2.1 remains shadow-only."""
         seed = abs(hash(json.dumps(model, sort_keys=True))) % (2**32)
         rng = np.random.default_rng(seed)
         home = rng.poisson(float(model["lambda_home"]), self.config.simulations)
         away = rng.poisson(float(model["lambda_away"]), self.config.simulations)
         total, results = home + away, []
         for m in markets:
-            p, ev = None, None
             if m["market_type"] == "moneyline":
                 p = float(np.mean(home > away) if m["side"] == "home" else np.mean(away > home) if m["side"] == "away" else np.mean(home == away))
                 ev = p * m["decimal_price"] - 1
             elif m["market_type"] == "spread":
-                values = home - away if m["side"] == "home" else away - home
-                ev, p = _asian_ev(values, float(m["line"]), m["decimal_price"])
-            elif m["market_type"] == "total":
+                ev, p = _asian_ev(home - away if m["side"] == "home" else away - home, float(m["line"]), m["decimal_price"])
+            else:
                 values = total if m["side"] == "over" else -total
-                handicap = -float(m["line"]) if m["side"] == "over" else float(m["line"])
-                ev, p = _asian_ev(values, handicap, m["decimal_price"])
-            playable = bool(ev is not None and ev >= self.config.min_ev)
-            results.append({**m, "model_probability": p, "implied_probability": 1 / m["decimal_price"],
-                            "ev": ev, "playable": playable,
-                            "label": "可推薦" if playable else "PASS｜未達 +EV 門檻"})
+                ev, p = _asian_ev(values, -float(m["line"]) if m["side"] == "over" else float(m["line"]), m["decimal_price"])
+            playable = bool(ev >= self.config.min_ev)
+            results.append({**m, "model_probability": p, "implied_probability": 1 / m["decimal_price"], "ev": ev,
+                            "playable": playable, "label": "可推薦" if playable else "PASS｜未達 +EV 門檻"})
         return results
 
     # ---------------------- internal display read layer -----------------------
     def get_published_rows(self, date_str: str) -> list[dict[str, Any]]:
         """Internal SQLite display reader; member routes must use get_member_snapshot."""
         with self._db() as conn:
-            rows = conn.execute("""SELECT e.event_id,e.league_key,e.kickoff,e.home_team,e.away_team,e.model_json,
+            rows = conn.execute("""SELECT e.event_id,e.kickoff,e.home_team,e.away_team,e.model_json,
               r.market_type,r.side,r.line,r.decimal_price,r.model_probability,r.ev,r.playable,r.label
               FROM football_events e LEFT JOIN football_recommendations r
               ON r.date_str=e.date_str AND r.event_id=e.event_id
@@ -806,18 +825,19 @@ class FootballModule:
                 first, latest = _first_and_latest_calibrations(history_by_event.get(key, []), current)
                 risk = model.get("risk", {})
                 record = grouped[key] = {
-                    "event_id": key, "league_key": row["league_key"], "forecast": model.get("display_forecast", {}), "sport": "football", "kickoff": row["kickoff"],
+                    "event_id": key, "sport": "football", "kickoff": row["kickoff"],
                     "home": row["home_team"], "away": row["away_team"], "model": model,
+                    # Compatibility display values for Core's existing
+                    # football_rows_to_shared_report contract.  This pure
+                    # helper consumes the already-saved model only.
+                    "forecast": _saved_forecast(model),
                     "risk": _risk_display(risk), "risk_display": _risk_display(risk),
                     "warning": _risk_warning(risk), "settlement_status": "pending",
                     "first_market": _markets_display(first, row["home_team"], row["away_team"]),
                     "latest_market": _markets_display(latest, row["home_team"], row["away_team"]),
                     "market_change": _market_change_display(first, latest, row["home_team"], row["away_team"]),
-                    "market_evaluations": [],
                     "recommendations": [],
                 }
-            if row["market_type"]:
-                record["market_evaluations"].append({k: row[k] for k in ("market_type", "side", "line", "decimal_price", "model_probability", "ev", "playable", "label")})
             if row["market_type"] and row["playable"]:
                 recommendation = {k: row[k] for k in ("market_type", "side", "line", "decimal_price", "model_probability", "ev", "playable", "label")}
                 recommendation["display"] = _market_selection_display(recommendation, row["home_team"], row["away_team"])
@@ -878,7 +898,7 @@ class FootballModule:
             metadata["release_status"] = "published"
             metadata["updated_at"] = manual["published_at"]
             return {
-                "release_status": "published", "rows": payload["rows"], "run_metadata": metadata,
+                "release_status": "published", "rows": _rows_with_saved_forecast(payload["rows"]), "run_metadata": metadata,
                 "snapshot_kind": "manual", "calibration_state": "manual_published",
                 "stale_warning": None, "updated_at": manual["published_at"],
             }
@@ -901,7 +921,7 @@ class FootballModule:
                              "market_observed_at": automatic["market_observed_at"],
                              "calibration_source": "自動更新／尚未人工校正"})
             return {
-                "release_status": "automatic_available", "rows": payload["rows"], "run_metadata": metadata,
+                "release_status": "automatic_available", "rows": _rows_with_saved_forecast(payload["rows"]), "run_metadata": metadata,
                 "snapshot_kind": "automatic", "calibration_state": "尚未人工校正",
                 "stale_warning": stale_warning, "updated_at": automatic["updated_at"],
             }
@@ -1047,39 +1067,34 @@ def _sources_display(summary: Mapping[str, Any]) -> str:
         ("espn_events", "ESPN", "場"),
         ("clubelo_teams", "ClubElo", "隊"),
         ("odds_quotes", "The Odds API", "筆盤口"),
-        ("api_football_prematch_quotes", "API-Football 賽前盤", "筆"),
     )
     parts = [f"{label} {_number_display(summary[key])}{unit}" for key, label, unit in labels if key in summary]
-    parts.extend(f"{name}：{message}" for name, message in summary.get("diagnostics", {}).items())
     return "｜".join(parts) if parts else "尚未儲存資料來源摘要"
 
-
-def _automatic_market_status(summary: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> str:
-    """Create a short, safe admin-only explanation of automatic market use."""
-
-    rows = list(rows)
-    market_events = int(summary.get("market_reference_events") or 0)
-    odds_quotes = int(summary.get("odds_quotes") or 0)
-    fallback_events = int(summary.get("api_football_prematch_events") or 0)
-    evaluated = sum(bool(row.get("market_evaluations")) for row in rows)
-    playable = sum(
-        1 for row in rows for item in row.get("market_evaluations", ())
-        if bool(item.get("playable"))
-    )
-    return (
-        f"足球盤口診斷：The Odds API {odds_quotes} 筆／API-Football 賽前盤補強 {fallback_events} 場／"
-        f"可用盤口 {market_events}/{len(rows)} 場／已運算 {evaluated} 場／達 +EV {playable} 筆"
-    )
-
 def _team_key(value: Any) -> str:
-    key = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode().casefold())
-    return _TEAM_ALIASES.get(key, key)
+    # Source names vary in accents (Málaga/Malaga), punctuation and common
+    # club suffixes.  Removing combining accents first keeps ClubElo, ESPN and
+    # The Odds API matching deterministic without altering displayed names.
+    text = unicodedata.normalize("NFKD", str(value).casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"\b(?:fc|cf|afc|sc)\b", "", text)
+    key = re.sub(r"[^a-z0-9]", "", text)
+    # Provider naming aliases only.  These normalise the same club across
+    # schedule, ratings and market feeds; they do not affect any model rule.
+    aliases = {
+        "celtavigo": "celta", "celta": "celta",
+        "parissaintgermain": "psg", "parissg": "psg", "psg": "psg",
+        "manchestercity": "mancity", "mancity": "mancity",
+        "manchesterunited": "manunited", "manunited": "manunited",
+        "tottenhamhotspur": "tottenham", "tottenham": "tottenham",
+        "newcastleunited": "newcastle", "newcastle": "newcastle",
+        "atleticomadrid": "atletico", "atletico": "atletico",
+        "athleticclub": "bilbao", "athleticbilbao": "bilbao", "bilbao": "bilbao",
+    }
+    return aliases.get(key, key)
 
 def _local_date(value: Any) -> str:
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=TZ_UTC)
-    return parsed.astimezone(TZ_TAIPEI).date().isoformat()
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date().isoformat()
 
 def _league_goal_prior(league: str) -> tuple[float, float]:
     return {"eng.1": (1.55,1.25), "esp.1": (1.40,1.10), "ger.1": (1.65,1.35),
@@ -1096,6 +1111,174 @@ def _team_rates(stats: Mapping[str, Any], venue: str) -> tuple[float, float]:
     try: defence = float(against_key)
     except (TypeError, ValueError): defence = 1.25
     return max(.35, min(2.8, attack)), max(.35, min(2.8, defence))
+
+def _team_rates_with_quality(stats: Mapping[str, Any], venue: str) -> tuple[float, float, dict[str, Any]]:
+    """Return rates plus honest source/fallback metadata; no claim of event xG."""
+    goals = stats.get("goals", {}) if isinstance(stats, Mapping) else {}
+    averages = goals.get("for", {}).get("average", {}) if isinstance(goals, Mapping) else {}
+    against = goals.get("against", {}).get("average", {}) if isinstance(goals, Mapping) else {}
+    attack_value = averages.get(venue) or averages.get("total")
+    defence_value = against.get(venue) or against.get("total")
+    fallback: list[str] = []
+    try: attack = float(attack_value)
+    except (TypeError, ValueError): attack, fallback = 1.25, [f"{venue} 進球統計不足：fallback_league"]
+    try: defence = float(defence_value)
+    except (TypeError, ValueError): defence, fallback = 1.25, fallback + [f"{venue} 失球統計不足：fallback_league"]
+    fixtures = stats.get("fixtures", {}) if isinstance(stats, Mapping) else {}
+    played = fixtures.get("played", {}).get(venue) or fixtures.get("played", {}).get("total") or 0
+    try: played = max(0, int(played))
+    except (TypeError, ValueError): played = 0
+    shrinkage = min(.80, played / 25)  # 20–30 match target, shrunk when shorter.
+    if played < 20:
+        fallback.append(f"{venue} 樣本 {played} 場：向聯賽均值收縮 {1 - shrinkage:.0%}")
+    return max(.35, min(2.8, attack)), max(.35, min(2.8, defence)), {
+        "venue": venue, "recent_venue_stats": bool(attack_value is not None and defence_value is not None),
+        "shot_based_xg": False, "xg_source": "unavailable", "quality": "fallback_goals" if not fallback else "fallback_league",
+        "goals_fallback": True, "matches_used": played, "shrinkage": round(shrinkage, 3), "fallback_reason": fallback,
+    }
+
+def _shrink_rate(value: float, prior: float, shrinkage: float) -> float:
+    return prior + max(0.0, min(.80, shrinkage)) * (value - prior)
+
+def _has_confirmed_lineups(event: Mapping[str, Any]) -> bool:
+    lineups = event.get("lineups") or []
+    return len(lineups) >= 2 and all(item.get("startXI") for item in lineups[:2])
+
+def _model_confidence(home: Mapping[str, Any], away: Mapping[str, Any], clubelo: bool, confirmed_lineups: bool) -> float:
+    score = .25 + .25 * min(home.get("shrinkage", 0), away.get("shrinkage", 0))
+    score += .20 if clubelo else 0
+    score += .15 if confirmed_lineups else 0
+    score -= .05 * (len(home.get("fallback_reason", [])) + len(away.get("fallback_reason", [])))
+    return round(max(.15, min(.80, score)), 3)
+
+def _dixon_coles_tau(home: int, away: int, home_lambda: float, away_lambda: float, rho: float) -> float:
+    if home == 0 and away == 0: return 1 - home_lambda * away_lambda * rho
+    if home == 0 and away == 1: return 1 + home_lambda * rho
+    if home == 1 and away == 0: return 1 + away_lambda * rho
+    if home == 1 and away == 1: return 1 - rho
+    return 1.0
+
+def _score_matrix(home_lambda: float, away_lambda: float, rho: float = -0.08, max_goals: int = 8) -> np.ndarray:
+    home = np.arange(max_goals + 1)
+    away = np.arange(max_goals + 1)
+    hp = np.exp(-home_lambda) * np.power(home_lambda, home) / np.vectorize(math.factorial)(home)
+    ap = np.exp(-away_lambda) * np.power(away_lambda, away) / np.vectorize(math.factorial)(away)
+    matrix = np.outer(hp, ap)
+    for i in range(2):
+        for j in range(2): matrix[i, j] *= _dixon_coles_tau(i, j, home_lambda, away_lambda, rho)
+    return matrix / matrix.sum()
+
+def _matrix_mode(matrix: np.ndarray) -> tuple[int, int]:
+    index = np.unravel_index(int(np.argmax(matrix)), matrix.shape)
+    return int(index[0]), int(index[1])
+
+def _market_key(market: Mapping[str, Any]) -> tuple[str, str, Optional[float]]:
+    line = market.get("line")
+    if market.get("market_type") == "spread": line = abs(float(line))
+    return str(market.get("market_type")), str(market.get("side")), None if line is None else round(float(line), 2)
+
+def _devig_market_probabilities(markets: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str, Optional[float]], float]:
+    groups: dict[tuple[str, Optional[float]], list[Mapping[str, Any]]] = {}
+    for market in markets:
+        line = market.get("line")
+        group_line = None if market.get("market_type") == "moneyline" else round(abs(float(line)), 2)
+        groups.setdefault((str(market.get("market_type")), group_line), []).append(market)
+    output: dict[tuple[str, str, Optional[float]], float] = {}
+    expected = {"moneyline": 3, "spread": 2, "total": 2}
+    for (market_type, _), items in groups.items():
+        if len(items) != expected.get(market_type): continue
+        inverse = [1 / float(item["decimal_price"]) for item in items]
+        total = sum(inverse)
+        for item, implied in zip(items, inverse): output[_market_key(item)] = implied / total
+    return output
+
+def _matrix_market_value(matrix: np.ndarray, market: Mapping[str, Any]) -> tuple[float, float]:
+    home, away = np.indices(matrix.shape)
+    if market["market_type"] == "moneyline":
+        settled = home > away if market["side"] == "home" else away > home if market["side"] == "away" else home == away
+        probability = float(matrix[settled].sum())
+        return probability, probability * float(market["decimal_price"]) - 1
+    values = home - away if market["market_type"] == "spread" and market["side"] == "home" else away - home if market["market_type"] == "spread" else home + away if market["side"] == "over" else -(home + away)
+    handicap = float(market["line"]) if market["market_type"] == "spread" else -float(market["line"]) if market["side"] == "over" else float(market["line"])
+    profits, wins = [], []
+    for leg in _asian_parts(handicap):
+        settled = np.sign(values + leg)
+        profits.append(np.where(settled > 0, float(market["decimal_price"]) - 1, np.where(settled < 0, -1., 0.)))
+        wins.append(settled > 0)
+    return float((np.mean(np.stack(wins), axis=0) * matrix).sum()), float((np.mean(np.stack(profits), axis=0) * matrix).sum())
+
+def _logit_blend(model_probability: float, market_probability: float, model_weight: float) -> float:
+    clamp = lambda p: min(.999, max(.001, float(p)))
+    logit = lambda p: math.log(clamp(p) / (1 - clamp(p)))
+    value = model_weight * logit(model_probability) + (1 - model_weight) * logit(market_probability)
+    return 1 / (1 + math.exp(-value))
+
+def _fusion_model_weight(confidence: float, quality: Mapping[str, Any]) -> float:
+    penalty = .10 if not quality.get("clubelo") else 0
+    penalty += .10 if not quality.get("lineups_confirmed") else 0
+    penalty += min(.20, .03 * len(quality.get("fallback_reason", [])))
+    return round(max(.15, min(.75, confidence - penalty)), 3)
+
+def _fusion_reason(model_weight: float, quality: Mapping[str, Any]) -> str:
+    if model_weight <= .30: return "資料品質/先發/ClubElo 不完整：提高市場權重"
+    if model_weight >= .60: return "資料完整且模型品質較高：提高模型權重"
+    return "模型與市場依資料品質進行 logit 融合"
+
+def _has_configured_season(seasons: Mapping[str, int]) -> bool:
+    """Whether any supported league has an API-Football season configured."""
+    return any(isinstance(seasons.get(league), int) and seasons[league] >= 1900 for league in DEFAULT_LEAGUES)
+
+def _saved_forecast(model: Mapping[str, Any], quant_forecast: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """Build the legacy display forecast from an already-saved Football model.
+
+    This is deliberately a pure compatibility wrapper for Core and old
+    integrations.  It does not fetch, write SQLite, validate markets, or run
+    recommendation/+EV calculation.  ``home_xg`` and ``away_xg`` retain their
+    historic field names but are explicitly labelled as model expected goals,
+    not shot-based provider xG.
+    """
+    audit = quant_forecast if isinstance(quant_forecast, Mapping) else model.get("quant_forecast")
+    home_lambda = float((audit or {}).get("model_lambda_home", model.get("model_lambda_home", model.get("lambda_home", 0.0))) or 0.0)
+    away_lambda = float((audit or {}).get("model_lambda_away", model.get("model_lambda_away", model.get("lambda_away", 0.0))) or 0.0)
+    matrix = _score_matrix(home_lambda, away_lambda, rho=-0.08)
+    mode = (audit or {}).get("exact_score_mode") or model.get("exact_score_mode")
+    if not mode:
+        selected = _matrix_mode(matrix)
+        mode = f"{selected[0]}:{selected[1]}"
+    one_x_two = (audit or {}).get("one_x_two") or {}
+    home, away = np.indices(matrix.shape)
+    return {
+        "home_xg": home_lambda,
+        "away_xg": away_lambda,
+        "score": str(mode),
+        "home_probability": float(one_x_two.get("home", matrix[home > away].sum())),
+        "draw_probability": float(one_x_two.get("draw", matrix[home == away].sum())),
+        "away_probability": float(one_x_two.get("away", matrix[home < away].sum())),
+        "goal_semantics": "模型預估進球（非 shot-based 資料 xG）",
+        "score_distribution_method": "Dixon-Coles adjusted Poisson joint score matrix",
+    }
+
+def _rows_with_saved_forecast(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Normalise older persisted snapshot rows without mutating SQLite."""
+    output: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        if not isinstance(row.get("forecast"), Mapping):
+            row["forecast"] = _saved_forecast(row.get("model") or {}, row.get("quant_forecast"))
+        output.append(row)
+    return output
+
+def _quant_forecast(model: Mapping[str, Any], matrix: np.ndarray, recommendations: list[Mapping[str, Any]]) -> dict[str, Any]:
+    home, away = np.indices(matrix.shape)
+    mode = _matrix_mode(matrix)
+    return {"model_version": FOOTBALL_MODEL_VERSION, "goal_semantics": model.get("goal_semantics"),
+            "model_lambda_home": model.get("model_lambda_home", model.get("lambda_home")),
+            "model_lambda_away": model.get("model_lambda_away", model.get("lambda_away")),
+            "expected_goals_conceded_home": model.get("expected_goals_conceded_home"),
+            "expected_goals_conceded_away": model.get("expected_goals_conceded_away"),
+            "exact_score_mode": f"{mode[0]}:{mode[1]}", "score_distribution_method": model.get("score_distribution_method"),
+            "one_x_two": {"home": float(matrix[home > away].sum()), "draw": float(matrix[home == away].sum()), "away": float(matrix[home < away].sum())},
+            "quality": model.get("quality", {}), "recommendation_audit": recommendations}
 
 def _injury_count(injuries: Iterable[Mapping[str, Any]], team_name: str) -> int:
     key = _team_key(team_name)
@@ -1138,16 +1321,7 @@ def _consensus_event(league: str, event: Mapping[str, Any]) -> list[dict[str, An
             if not mt: continue
             for outcome in market.get("outcomes", []):
                 name = str(outcome.get("name", ""))
-                # Provider team labels can be abbreviated or accent-normalised.
-                # Use the same identity key as event matching so a real price is
-                # not discarded before it reaches the existing market validator.
-                side = (
-                    "over" if mt == "total" and name.casefold() == "over" else
-                    "under" if mt == "total" and name.casefold() == "under" else
-                    "home" if _team_key(name) == _team_key(home) else
-                    "away" if _team_key(name) == _team_key(away) else
-                    "draw" if mt == "moneyline" and name.casefold() == "draw" else None
-                )
+                side = "over" if mt == "total" and name.casefold() == "over" else "under" if mt == "total" else "home" if name == home else "away" if name == away else "draw" if mt == "moneyline" and name.casefold() == "draw" else None
                 if side and outcome.get("price") is not None:
                     buckets.setdefault((mt,side), []).append((outcome.get("point"), float(outcome["price"]), observed))
     rows = []
@@ -1159,172 +1333,18 @@ def _consensus_event(league: str, event: Mapping[str, Any]) -> list[dict[str, An
             "observed_at": max(x[2] for x in values), "source_count": len(values)})
     return rows
 
-
-def _has_usable_market_records(records: Iterable[Mapping[str, Any]]) -> bool:
-    """Use the existing market validator to decide whether a fallback is needed."""
-
-    values = list(records)
-    if not values:
-        return False
-    try:
-        normalised = [_validate_market({
-            **dict(value),
-            "decimal_price": value.get("decimal_price", value.get("price")),
-        }) for value in values]
-        _validate_market_set(normalised)
-    except (TypeError, ValueError):
-        return False
-    return bool(normalised)
-
-
-def _api_football_prematch_records(event: Mapping[str, Any], payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Adapt API-Football's already-configured pre-match odds to normal rows.
-
-    No figure is inferred here.  A market is retained only when its sides form
-    a valid moneyline, Asian-handicap, or total pair.  The Football domain
-    module later applies its existing validator and Poisson/+EV calculation.
-    """
-
-    home, away = str(event.get("home") or ""), str(event.get("away") or "")
-    if not home or not away:
-        return []
-    buckets: dict[tuple[str, str, Optional[float]], list[tuple[float, str]]] = {}
-    for fixture in payload.get("response") or ():
-        if not isinstance(fixture, Mapping):
-            continue
-        observed = str(fixture.get("update") or _now())
-        for bookmaker in fixture.get("bookmakers") or ():
-            if not isinstance(bookmaker, Mapping):
-                continue
-            for bet in bookmaker.get("bets") or ():
-                if not isinstance(bet, Mapping):
-                    continue
-                market_type = _api_football_market_type(bet.get("name"))
-                if not market_type:
-                    continue
-                for outcome in bet.get("values") or ():
-                    if not isinstance(outcome, Mapping):
-                        continue
-                    parsed = _api_football_outcome(
-                        market_type, outcome.get("value"), home, away,
-                    )
-                    if parsed is None:
-                        continue
-                    side, line = parsed
-                    try:
-                        price = float(outcome.get("odd", outcome.get("price")))
-                    except (TypeError, ValueError):
-                        continue
-                    if price > 1:
-                        buckets.setdefault((market_type, side, line), []).append((price, observed))
-
-    def record(market_type: str, side: str, line: Optional[float]) -> Optional[dict[str, Any]]:
-        values = buckets.get((market_type, side, line), [])
-        if not values:
-            return None
-        prices, observed_times = zip(*values)
-        return {
-            "league": event.get("league_key"), "kickoff": event.get("kickoff"),
-            "home": home, "away": away, "market_type": market_type, "side": side,
-            "line": line, "price": float(np.median(prices)),
-            "provider": "API-Football pre-match odds", "observed_at": max(observed_times),
-            "source_count": len(values),
-        }
-
-    rows: list[dict[str, Any]] = []
-    # A standard 1X2 market can be calculated even when draw is not offered.
-    for side in ("home", "draw", "away"):
-        item = record("moneyline", side, None)
-        if item:
-            rows.append(item)
-
-    # Preserve a coherent Asian pair rather than combining unrelated lines from
-    # different bookmakers.  Pick the most frequently observed valid pair.
-    spread_pairs: list[tuple[int, float]] = []
-    for (market_type, side, line), values in buckets.items():
-        if market_type == "spread" and side == "home" and line is not None:
-            opposite = buckets.get(("spread", "away", -line), [])
-            if opposite:
-                spread_pairs.append((len(values) + len(opposite), line))
-    if spread_pairs:
-        _, line = max(spread_pairs, key=lambda item: (item[0], -abs(item[1])))
-        rows.extend(item for item in (record("spread", "home", line), record("spread", "away", -line)) if item)
-
-    total_pairs: list[tuple[int, float]] = []
-    for (market_type, side, line), values in buckets.items():
-        if market_type == "total" and side == "over" and line is not None:
-            opposite = buckets.get(("total", "under", line), [])
-            if opposite:
-                total_pairs.append((len(values) + len(opposite), line))
-    if total_pairs:
-        _, line = max(total_pairs, key=lambda item: (item[0], -item[1]))
-        rows.extend(item for item in (record("total", "over", line), record("total", "under", line)) if item)
-    return rows if _has_usable_market_records(rows) else []
-
-
-def _api_football_market_type(value: Any) -> Optional[str]:
-    name = re.sub(r"\s+", " ", str(value or "").casefold()).strip()
-    if any(token in name for token in ("asian handicap", "handicap")):
-        return "spread"
-    if any(token in name for token in ("over/under", "over under", "total goals", "goals over")):
-        return "total"
-    if name in {"match winner", "winner", "1x2", "match result", "result"}:
-        return "moneyline"
-    return None
-
-
-def _api_football_outcome(
-    market_type: str, value: Any, home: str, away: str,
-) -> Optional[tuple[str, Optional[float]]]:
-    text = str(value or "").strip()
-    folded = text.casefold()
-    if market_type == "moneyline":
-        if folded in {"1", "home", "home win"} or folded.startswith("home "):
-            return "home", None
-        if folded in {"x", "draw", "tie"}:
-            return "draw", None
-        if folded in {"2", "away", "away win"} or folded.startswith("away "):
-            return "away", None
-        team_key = _team_key(re.sub(r"[^A-Za-zÀ-ÿ .'-]", "", text))
-        if team_key == _team_key(home):
-            return "home", None
-        if team_key == _team_key(away):
-            return "away", None
-        return None
-    if market_type == "total":
-        side = "over" if folded.startswith("over") else "under" if folded.startswith("under") else ""
-        line = _api_football_line(text)
-        return (side, line) if side and line is not None else None
-    if market_type == "spread":
-        side = "home" if folded.startswith("home") else "away" if folded.startswith("away") else ""
-        if not side:
-            stripped = re.sub(r"[+-]?\d+(?:\.\d+)?", "", text)
-            key = _team_key(stripped)
-            side = "home" if key == _team_key(home) else "away" if key == _team_key(away) else ""
-        line = _api_football_line(text)
-        return (side, line) if side and line is not None else None
-    return None
-
-
-def _api_football_line(value: str) -> Optional[float]:
-    match = re.search(r"(?<![A-Za-z])([+-]?\d+(?:\.\d+)?)", str(value))
-    if not match:
-        return None
-    try:
-        line = float(match.group(1))
-    except ValueError:
-        return None
-    return line if math.isclose(line * 4, round(line * 4)) else None
-
 def _match_odds(records: Iterable[Mapping[str, Any]], event: Mapping[str, Any]) -> list[dict[str, Any]]:
     # Kept outside the class for testability; match on league, two teams, kickoff within 30 min.
     target = datetime.fromisoformat(str(event["kickoff"]).replace("Z", "+00:00"))
+    # Market sides must remain ordered: accepting a reversed home/away pair
+    # would invert Asian-handicap and 1X2 recommendations.
     target_teams = (_team_key(event["home"]), _team_key(event["away"]))
     out=[]
     for row in records:
         try: delta=abs((target-datetime.fromisoformat(str(row["kickoff"]).replace("Z", "+00:00"))).total_seconds())
         except (ValueError, TypeError): continue
-        if row.get("league") == event.get("league_key") and target_teams == (_team_key(row.get("home")),_team_key(row.get("away"))) and delta <= 1800:
+        row_teams = (_team_key(row.get("home")), _team_key(row.get("away")))
+        if row.get("league") == event.get("league_key") and target_teams == row_teams and delta <= 1800:
             out.append(dict(row))
     return out
 
@@ -1364,63 +1384,3 @@ def _validate_market_set(markets: list[Mapping[str, Any]]) -> None:
         raise ValueError("home and away handicap lines must be opposites")
     if ("total","over") in by and not np.isclose(by[("total","over")]["line"], by[("total","under")]["line"]):
         raise ValueError("over and under lines must match")
-
-
-_TEAM_ALIASES = {
-    "manchesterunited": "manunited", "manchestercity": "mancity",
-    "tottenhamhotspur": "tottenham", "newcastleunited": "newcastle",
-    "westhamunited": "westham", "wolverhamptonwanderers": "wolves",
-    "brightonhovealbion": "brighton", "nottinghamforest": "forest",
-    "bayernmunich": "bayern", "bayernmunchen": "bayern",
-    "borussiadortmund": "dortmund", "bayerleverkusen": "leverkusen",
-    "borussiamonchengladbach": "gladbach", "rbleipzig": "leipzig",
-    "internazionale": "inter", "intermilan": "inter", "acmilan": "milan",
-    "parissaintgermain": "psg", "parissg": "psg", "psg": "psg",
-    "atleticomadrid": "atletico", "atlmadrid": "atletico",
-    "athleticclub": "bilbao", "athleticbilbao": "bilbao",
-    "athbilbao": "bilbao", "celtavigo": "celta", "realbetis": "betis",
-    "realsociedad": "sociedad",
-    "bdortmund": "dortmund", "monchengladbach": "gladbach",
-    "mgladbach": "gladbach", "psveindhoven": "psv",
-    "rcdespanyol": "espanyol", "dalaves": "alaves",
-    "deportivo": "alaves", "deportivoalaves": "alaves", "alaves": "alaves",
-    "villarrealcf": "villarreal", "realvalladolid": "valladolid",
-    "parisfc": "parisfc", "olympiquelyonnais": "lyon",
-    "olympiquedemarseille": "marseille", "asroma": "roma",
-}
-
-def _provider_failure(exc):
-    try:
-        body = exc.response.json()
-        if body.get("error_code") == "OUT_OF_USAGE_CREDITS":
-            return "The Odds API 可用額度已用完"
-        if body.get("error_code") == "INVALID_KEY":
-            return "The Odds API 金鑰無效"
-    except (AttributeError, TypeError, ValueError):
-        pass
-    code = getattr(getattr(exc, "response", None), "status_code", None) or getattr(exc, "code", None)
-    if code in (401, 403): return "認證或存取權限失敗，請檢查金鑰與方案"
-    if code == 429: return "請求額度或速率限制，請檢查帳戶額度"
-    if code == 422: return "API 不接受查詢參數或市場，請檢查方案與市場設定"
-    if code: return f"來源 HTTP {int(code)} 錯誤"
-    if isinstance(exc, (ValueError, KeyError)): return "來源資料格式不符"
-    return "來源連線、逾時或 TLS 失敗"
-
-def _saved_forecast(model):
-    """Backend-only display projection of the existing independent Poisson model.
-
-    Does not feed recommendations, odds validation or the Base Model.
-    Members read the resulting numbers from snapshots, never call this function.
-    """
-    h, a = float(model["lambda_home"]), float(model["lambda_away"])
-    n = max(30, int(max(h, a) + 12 * math.sqrt(max(h, a)) + 10))
-    hp, ap = [math.exp(-h)], [math.exp(-a)]
-    for i in range(1, n):
-        hp.append(hp[-1] * h / i); ap.append(ap[-1] * a / i)
-    home = sum(hp[i] * sum(ap[:i]) for i in range(n))
-    draw = sum(hp[i]*ap[i] for i in range(n))
-    away = sum(ap[i] * sum(hp[:i]) for i in range(n))
-    total = home + draw + away
-    return {"home_probability": home/total, "draw_probability": draw/total,
-            "away_probability": away/total, "home_xg": h, "away_xg": a,
-            "score": f"{max(range(n), key=hp.__getitem__)}–{max(range(n), key=ap.__getitem__)}"}

@@ -1,6 +1,6 @@
-# V12 上傳清單（請整包覆蓋）
+# V13 上傳清單（請整包覆蓋）
 
-V12 包含會員連結、足球聯賽選擇與人工輸入修正，必須與以下清單一起上傳。
+V13 包含會員帳號專屬連結，必須與以下清單一起上傳。
 
 請把本資料夾中的下列檔案全部上傳到 GitHub 專案根目錄；不要混用舊版同名檔案，也不要只挑其中幾個 `.py` 檔。
 
@@ -23,7 +23,7 @@ source_health.py
 logo.png
 requirements.txt
 README.md
-V12_UPDATE.md
+V13_UPDATE.md
 REGRESSION_TESTS.md
 DEPLOYMENT_MANIFEST.md
 ```
@@ -37,4 +37,4 @@ docker-compose.yml
 
 `tests/` 是開發測試檔，不必上傳到 Streamlit Cloud。`jobs/` 是舊的背景排程入口，本版採管理員手動建立快照，不必上傳。
 
-本次請務必以此 V12 資料夾內的所有清單檔案覆蓋舊版，避免新舊模組混用。
+本次請務必以此 V13 資料夾內的所有清單檔案覆蓋舊版，避免新舊模組混用。

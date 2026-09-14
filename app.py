@@ -19,7 +19,7 @@ from member_experience import show_report
 from live_ui import render_live
 from source_health import check_sources
 from football_display import LEAGUES, team_name
-from member_links import render_member_link, resolve_login_role
+from member_links import render_member_link, resolve_login_role, verify_member_link
 from manual_odds import hk_to_decimal
 from mlb_pre_release_module import (
     MLBAutoSnapshotRunner, MLBPreReleaseService, SuperQuote, parse_super_line,
@@ -63,7 +63,19 @@ def _render_brand() -> None:
 
 def _login() -> None:
     _render_brand()
-    st.caption("輸入會員密碼進入賽事查詢；輸入管理員密碼會直接進入後台。")
+    member_entry = st.query_params.get("view") == "member"
+    member_account = str(st.query_params.get("member", ""))
+    member_signature = str(st.query_params.get("signature", ""))
+    link_secret = os.environ.get("APP_MEMBER_LINK_SECRET", "")
+    if member_account or member_signature:
+        if not verify_member_link(member_account, member_signature, link_secret):
+            st.error("此會員連結無效或已被修改，請向管理員索取新的專屬連結。")
+            st.stop()
+        st.caption(f"會員帳號：{member_account}｜請輸入會員密碼進入賽事查詢。")
+    elif member_entry:
+        st.caption("請輸入會員密碼進入賽事查詢。")
+    else:
+        st.caption("輸入會員密碼進入賽事查詢；輸入管理員密碼會直接進入後台。")
     member_password = os.environ.get("APP_MEMBER_PASSWORD", "")
     admin_password = os.environ.get("APP_ADMIN_PASSWORD", "")
     if not member_password or not admin_password:
@@ -71,7 +83,7 @@ def _login() -> None:
         st.stop()
     password = st.text_input("登入密碼", type="password", key="login_password")
     if st.button("登入", type="primary"):
-        role = resolve_login_role(password, member_password, admin_password, st.query_params.get("view") == "member")
+        role = resolve_login_role(password, member_password, admin_password, member_entry)
         if role == "admin":
             st.session_state.user_role = "admin"
             st.rerun()
