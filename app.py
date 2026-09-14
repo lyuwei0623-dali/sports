@@ -18,7 +18,7 @@ from app_services import AppServices, compose_services
 from member_experience import show_report
 from live_ui import render_live
 from source_health import check_sources
-from football_display import team_name
+from football_display import LEAGUES, team_name
 from member_links import render_member_link, resolve_login_role
 from manual_odds import hk_to_decimal
 from mlb_pre_release_module import (
@@ -107,6 +107,19 @@ def _matchup_label(row: dict[str, object], sport: str) -> str:
     return f"{team_name(away)}（客） vs {team_name(home)}（主）"
 
 
+def _football_matchup_label(row: dict[str, object]) -> str:
+    """Give the administrator a readable league + Chinese-team selector.
+
+    ``league_key`` remains the Football module's provider identity.  This is
+    display-only metadata and therefore cannot affect fixture matching or
+    Asian-line settlement.
+    """
+
+    league_key = str(row.get("league_key", ""))
+    league = LEAGUES.get(league_key, "其他聯賽")
+    return f"{league}｜{_matchup_label(row, 'football')}"
+
+
 def _normalise_mlb_home_line(raw: str) -> str:
     """Validate the one home-team SUPER line entered by the administrator.
 
@@ -162,6 +175,50 @@ def _parse_home_asian_handicap(raw: str) -> float:
     if not math.isclose(line * 4, round(line * 4)):
         raise ValueError("亞洲盤只接受 0.25 的倍數")
     return line
+
+
+def _parse_asian_total(raw: str) -> float:
+    """Validate a conventional Asian total before calling Football.
+
+    This prevents a browser-edited value such as ``2.53`` from reaching the
+    domain module, where it previously appeared as an unexplained English
+    exception.  Split totals are represented by their existing midpoint:
+    ``2/2.5`` becomes ``2.25`` and ``2.5/3`` becomes ``2.75``.
+    """
+
+    text = str(raw).strip().replace(" ", "")
+    if not text:
+        raise ValueError("大小分盤不可空白")
+    try:
+        if "/" in text:
+            values = [float(part) for part in text.split("/")]
+            if len(values) != 2 or any(value < 0 for value in values) or not math.isclose(values[1] - values[0], 0.5):
+                raise ValueError
+            line = sum(values) / 2
+        else:
+            line = float(text)
+            if line < 0:
+                raise ValueError
+    except ValueError as exc:
+        raise ValueError("大小分請填 2.5、2/2.5 或 2.5/3") from exc
+    if not math.isclose(line * 4, round(line * 4)):
+        raise ValueError("大小分只接受 0.25 的倍數，例如 2.5、2/2.5 或 2.5/3")
+    return line
+
+
+def _football_input_error(exc: Exception) -> str:
+    """Keep Football domain-validation details out of the administrator UI."""
+
+    message = str(exc)
+    if "Asian lines must be multiples" in message:
+        return "讓分與大小分只接受 0.25 的倍數，例如 +0.5/1、2/2.5 或 2.5/3。"
+    if "decimal_price" in message:
+        return "所有水位必須大於 0；請輸入不含本金水位，例如 0.94。"
+    if "handicap lines" in message:
+        return "主隊讓分會自動產生相反的客隊讓分，請重新儲存本場資料。"
+    if "event must be included" in message:
+        return "此場不在目前已保存的足球快照中，請先重新執行足球自動快照。"
+    return "足球人工校正無法儲存，請確認盤口格式與水位後重試。"
 
 
 def _positive(value: float, label: str) -> float:
@@ -236,8 +293,13 @@ def _mlb_manual_section(app: AppServices, selected, date_str: str) -> None:
             st.session_state.pop(f"mlb_manual_quotes:{date_str}", None)
             render_snapshot_result(st, result, "mlb")
             show_report(st, app.members.get_mlb_admin_preview(date_str), admin=True)
+        except (TypeError, ValueError) as exc:
+            # A failed manual release must not leak into the member view or
+            # replace the valid automatic snapshot.  Surface only the input
+            # problem that an administrator can act on.
+            st.error(f"MLB 人工校正尚未發布：{str(exc)[:180]}")
         except Exception:
-            st.error("MLB 人工校正發布失敗，請確認所有盤口格式後重試。")
+            st.error("MLB 人工校正暫時無法發布；原有會員快照沒有被覆蓋。請稍後重試，或先重新建立 MLB 自動快照。")
 
 
 def _football_manual_section(app: AppServices, date_str: str) -> None:
@@ -251,7 +313,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
     event_indexes = tuple(range(len(rows)))
     row = rows[st.selectbox(
         "選擇要校正的比賽", event_indexes,
-        format_func=lambda index: _matchup_label(rows[index], "football"),
+        format_func=lambda index: _football_matchup_label(rows[index]),
         key=f"football_event:{date_str}",
     )]
     event_id = str(row.get("event_id"))
@@ -264,7 +326,10 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
         home_spread = spread_2.number_input("主隊讓分盤水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         away_spread = spread_3.number_input("客隊讓分盤水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         total_1, total_2, total_3 = st.columns(3)
-        total_line = total_1.number_input("大小分盤", min_value=0.0, value=2.5, step=0.25)
+        total_line_text = total_1.text_input(
+            "大小分盤", value="2.5",
+            help="支援 2.5、2/2.5、2.5/3；不接受 2.53 這類非亞洲盤數值。",
+        )
         over_price = total_2.number_input("大分水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         under_price = total_3.number_input("小分水位（不含本金）", min_value=0.001, value=0.94, step=0.001, format="%.3f")
         money_1, money_2, money_3 = st.columns(3)
@@ -275,6 +340,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
     if save_event:
         try:
             home_line = _parse_home_asian_handicap(home_line_text)
+            total_line = _parse_asian_total(total_line_text)
             markets = [
                 {"market_type": "spread", "side": "home", "line": home_line, "decimal_price": hk_to_decimal(home_spread)},
                 {"market_type": "spread", "side": "away", "line": -home_line, "decimal_price": hk_to_decimal(away_spread)},
@@ -288,7 +354,7 @@ def _football_manual_section(app: AppServices, date_str: str) -> None:
             home_direction = "主隊讓分" if home_line < 0 else "主隊受讓" if home_line > 0 else "平手盤"
             st.success(f"已儲存人工盤口：{_matchup_label(row, 'football')}｜{home_direction} {home_line:+g}；客隊自動對應 {-home_line:+g}")
         except (TypeError, ValueError) as exc:
-            st.error(str(exc))
+            st.error(_football_input_error(exc))
     if st.button("全部校正完成，發布足球"):
         try:
             app.football.confirm_daily_release(date_str, note="管理員人工亞洲盤校正")

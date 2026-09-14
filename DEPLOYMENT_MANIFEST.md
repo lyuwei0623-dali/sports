@@ -1,6 +1,6 @@
-# V11 上傳清單（請整包覆蓋）
+# V12 上傳清單（請整包覆蓋）
 
-V11 新增 manual_odds.py、member_links.py 及 V11_UPDATE.md，必須與以下清單一起上傳。
+V12 包含會員連結、足球聯賽選擇與人工輸入修正，必須與以下清單一起上傳。
 
 請把本資料夾中的下列檔案全部上傳到 GitHub 專案根目錄；不要混用舊版同名檔案，也不要只挑其中幾個 `.py` 檔。
 
@@ -16,11 +16,14 @@ live_calculator.py
 live_ui.py
 member_experience.py
 member_release_service.py
+manual_odds.py
+member_links.py
 mlb_pre_release_module.py
 source_health.py
 logo.png
 requirements.txt
 README.md
+V12_UPDATE.md
 REGRESSION_TESTS.md
 DEPLOYMENT_MANIFEST.md
 ```
@@ -34,4 +37,4 @@ docker-compose.yml
 
 `tests/` 是開發測試檔，不必上傳到 Streamlit Cloud。`jobs/` 是舊的背景排程入口，本版採管理員手動建立快照，不必上傳。
 
-本次請務必用 V10 的 `app.py`、`core_shared_ui.py`、`admin_snapshot_ui.py`、`mlb_pre_release_module.py`、`football_module.py`、`README.md` 與 `REGRESSION_TESTS.md` 覆蓋舊版；其餘清單檔案也一併覆蓋，避免新舊模組混用。
+本次請務必以此 V12 資料夾內的所有清單檔案覆蓋舊版，避免新舊模組混用。

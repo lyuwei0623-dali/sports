@@ -53,6 +53,8 @@ Osasuna|奧薩蘇納
 Rayo Vallecano|巴列卡諾
 Mallorca|馬略卡
 Alaves|阿拉維斯
+Deportivo|阿拉維斯
+Deportivo Alaves|阿拉維斯
 Levante|萊萬特
 Elche|埃爾切
 Real Oviedo|皇家奧維耶多
