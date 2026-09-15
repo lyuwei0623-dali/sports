@@ -13,7 +13,7 @@ rows saved by the daily backend refresh and administrator calibration step.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import math
 import os
@@ -21,6 +21,7 @@ import re
 import sqlite3
 import unicodedata
 from typing import Any, Iterable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 try:  # requests is preferred in production, but the module remains portable.
@@ -50,6 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover - used only in minimal runtimes
 
 
 TZ_UTC = timezone.utc
+TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 FOOTBALL_MODEL_VERSION = "football-v2.1-quant-shadow"
 DEFAULT_LEAGUES = {
     "eng.1": 39, "esp.1": 140, "ger.1": 78,
@@ -88,6 +90,9 @@ class FootballModule:
         # response bodies, URLs or exceptions here because they may contain
         # credentials.
         self._source_diagnostics: dict[str, str] = {}
+        # Per-run, safe counters.  They make a missing team-statistics feed
+        # visible instead of silently turning every fixture into league priors.
+        self._team_stat_health = {"requested": 0, "available": 0, "failed": 0}
         self._init_db()
 
     @classmethod
@@ -199,6 +204,7 @@ class FootballModule:
         replaced atomically per date.  Member UI must never call this method.
         """
         target = date.fromisoformat(date_str)
+        self._team_stat_health = {"requested": 0, "available": 0, "failed": 0}
         espn_index = self._fetch_espn_fixtures(target)
         api_events: list[dict[str, Any]] = []
         diagnostics: list[dict[str, str]] = []
@@ -254,7 +260,9 @@ class FootballModule:
                 stored += 1
             summary = {"api_football_events": len(api_events), "espn_events": len(espn_index),
                        "stored_events": stored, "schedule_source": "API-Football" if api_events else ("ESPN" if events else None),
-                       "diagnostics": diagnostics, "clubelo_teams": len(elo), "odds_quotes": len(odds)}
+                       "diagnostics": diagnostics, "clubelo_teams": len(elo), "odds_quotes": len(odds),
+                       "team_statistics": dict(self._team_stat_health),
+                       "timezone": "Asia/Taipei"}
             conn.execute("""INSERT INTO football_daily_runs VALUES(?,?,?,?)
               ON CONFLICT(date_str) DO UPDATE SET fetched_at=excluded.fetched_at,
               status=excluded.status,source_summary=excluded.source_summary""",
@@ -335,7 +343,7 @@ class FootballModule:
     def _build_automatic_snapshot_payload(self, date_str: str, updated_at: str) -> tuple[list[dict[str, Any]], dict[str, Any], Optional[str]]:
         """Build a display payload from saved backend data and standard football markets."""
         with self._db() as conn:
-            events = conn.execute("SELECT event_id,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
+            events = conn.execute("SELECT event_id,league_key,kickoff,home_team,away_team,model_json FROM football_events WHERE date_str=? ORDER BY kickoff,event_id", (date_str,)).fetchall()
             references = conn.execute("""SELECT event_id,market_type,side,line,price,observed_at
               FROM football_market_reference WHERE date_str=? ORDER BY event_id,observed_at""", (date_str,)).fetchall()
         if not events:
@@ -357,7 +365,11 @@ class FootballModule:
             if normalised:
                 _validate_market_set(normalised)
                 v21_recommendations = self._calculate_recommendations(model, normalised)
-                recommendations = v21_recommendations if self.config.v21_promoted else self._calculate_legacy_recommendations(model, normalised)
+                calculated = v21_recommendations if self.config.v21_promoted else self._calculate_legacy_recommendations(model, normalised)
+                # Never turn league-average fallbacks into a member-facing
+                # +EV tip.  Keep the saved forecast/risk so the operator can
+                # see exactly why this event needs a source retry.
+                recommendations = calculated if _has_reliable_team_inputs(model) else []
             else:
                 # No price means no implied probability, fusion, or +EV.  An
                 # empty recommendation list is the existing Core-compatible
@@ -366,10 +378,11 @@ class FootballModule:
             forecast = _quant_forecast(model, matrix=_score_matrix(float(model["lambda_home"]), float(model["lambda_away"]), rho=-0.08), recommendations=v21_recommendations)
             risk = model.get("risk", {})
             row = {
-                "event_id": event["event_id"], "sport": "football", "kickoff": event["kickoff"],
+                "event_id": event["event_id"], "sport": "football", "league_key": event["league_key"], "kickoff": event["kickoff"],
                 "home": event["home_team"], "away": event["away_team"], "model": model,
                 "risk": _risk_display(risk), "risk_display": _risk_display(risk),
                 "warning": _join_warning("自動更新／尚未人工校正", _risk_warning(risk),
+                    None if _has_reliable_team_inputs(model) else "球隊統計未完整取得：僅顯示聯賽基準預估，不提供自動推薦",
                     None if normalised else "即時盤口暫時無法取得：PASS（無有效可驗證價格）"),
                 "settlement_status": "pending",
                 "first_market": _markets_display(normalised, event["home_team"], event["away_team"]) if normalised else "尚無可驗證即時盤口",
@@ -458,7 +471,7 @@ class FootballModule:
             attempted += 1
             try:
                 response = requests.get(f"{self.config.api_football_base}/fixtures", headers=headers,
-                    params={"league": league_id, "season": season, "date": target.isoformat()}, timeout=12)
+                    params={"league": league_id, "season": season, "date": target.isoformat(), "timezone": "Asia/Taipei"}, timeout=12)
                 response.raise_for_status()
             except requests.RequestException:
                 failures += 1
@@ -468,13 +481,26 @@ class FootballModule:
                 teams = item.get("teams", {})
                 if not fixture.get("id") or not teams.get("home", {}).get("name"):
                     continue
+                if _taipei_date(fixture.get("date")) != target.isoformat():
+                    continue
                 home_id, away_id = teams["home"].get("id"), teams["away"].get("id")
                 team_stats = {
                     "home": self._fetch_team_statistics(headers, league_id, season, home_id, target),
                     "away": self._fetch_team_statistics(headers, league_id, season, away_id, target),
                 }
-                injuries = self._fetch_fixture_injuries(headers, fixture["id"])
-                lineups = self._fetch_fixture_lineups(headers, fixture["id"])
+                # Availability endpoints are optional enrichment.  A timeout
+                # here must not discard an otherwise valid fixture/statistics
+                # record or force the whole daily run into ESPN fallback.
+                try:
+                    injuries = self._fetch_fixture_injuries(headers, fixture["id"])
+                except Exception:
+                    injuries = []
+                    self._source_diagnostics["API-Football 傷停"] = "傷停資料暫時無法取得；已提高風險提示"
+                try:
+                    lineups = self._fetch_fixture_lineups(headers, fixture["id"])
+                except Exception:
+                    lineups = []
+                    self._source_diagnostics["API-Football 先發"] = "先發資料暫時無法取得；已提高風險提示"
                 out.append({"event_id": str(fixture["id"]), "league_key": league_key,
                     "kickoff": fixture.get("date"), "home": teams["home"]["name"],
                     "away": teams["away"]["name"], "home_id": home_id, "away_id": away_id,
@@ -489,11 +515,25 @@ class FootballModule:
                                team: Optional[int], target: date) -> dict[str, Any]:
         if not team:
             return {}
-        r = requests.get(f"{self.config.api_football_base}/teams/statistics", headers=headers,
-            params={"league": league, "season": season, "team": team, "date": target.isoformat()}, timeout=12)
-        if not r.ok:
+        self._team_stat_health["requested"] += 1
+        try:
+            r = requests.get(f"{self.config.api_football_base}/teams/statistics", headers=headers,
+                params={"league": league, "season": season, "team": team, "date": target.isoformat()}, timeout=12)
+        except Exception:
+            self._team_stat_health["failed"] += 1
+            self._source_diagnostics["API-Football 球隊統計"] = "球隊統計暫時無法取得；不會以聯賽預設值發出自動推薦"
             return {}
-        return r.json().get("response") or {}
+        if not r.ok:
+            self._team_stat_health["failed"] += 1
+            self._source_diagnostics["API-Football 球隊統計"] = "球隊統計來源拒絕或限制查詢；請檢查方案、額度與賽季設定"
+            return {}
+        response = r.json().get("response") or {}
+        if response:
+            self._team_stat_health["available"] += 1
+        else:
+            self._team_stat_health["failed"] += 1
+            self._source_diagnostics["API-Football 球隊統計"] = "球隊統計未回傳有效資料；不會以聯賽預設值發出自動推薦"
+        return response
 
     def _fetch_fixture_injuries(self, headers: Mapping[str, str], fixture_id: int) -> list[dict[str, Any]]:
         r = requests.get(f"{self.config.api_football_base}/injuries", headers=headers,
@@ -517,21 +557,27 @@ class FootballModule:
         """ESPN is a verification/fallback feed only, never a model feature."""
         out: dict[tuple[str, str], dict[str, Any]] = {}
         for league_key in DEFAULT_LEAGUES:
-            try:
-                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_key}/scoreboard"
-                r = requests.get(url, params={"dates": target.strftime("%Y%m%d"), "limit": 100}, timeout=8)
-                for event in r.json().get("events", []) if r.ok else []:
-                    comp = (event.get("competitions") or [{}])[0]
-                    names = {c.get("homeAway"): c.get("team", {}).get("name", "") for c in comp.get("competitors", [])}
-                    if names.get("home") and names.get("away"):
-                        # Store the ESPN league key with the event so it can
-                        # become a complete fallback event when API-Football
-                        # is unavailable.  No raw provider payload is exposed.
-                        saved_event = dict(event)
-                        saved_event["_football_league_key"] = league_key
-                        out[(_team_key(names["home"]), _team_key(names["away"]))] = saved_event
-            except requests.RequestException:
-                continue
+            # ESPN's scoreboard date is not a Taiwan-day contract.  Query the
+            # adjacent UTC day as well, then keep only events whose kickoff is
+            # on the administrator's Taiwan date.
+            for lookup_day in (target - timedelta(days=1), target):
+                try:
+                    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_key}/scoreboard"
+                    r = requests.get(url, params={"dates": lookup_day.strftime("%Y%m%d"), "limit": 100}, timeout=8)
+                    for event in r.json().get("events", []) if r.ok else []:
+                        if _taipei_date(event.get("date")) != target.isoformat():
+                            continue
+                        comp = (event.get("competitions") or [{}])[0]
+                        names = {c.get("homeAway"): c.get("team", {}).get("name", "") for c in comp.get("competitors", [])}
+                        if names.get("home") and names.get("away"):
+                            # Store the ESPN league key with the event so it can
+                            # become a complete fallback event when API-Football
+                            # is unavailable.  No raw provider payload is exposed.
+                            saved_event = dict(event)
+                            saved_event["_football_league_key"] = league_key
+                            out[(_team_key(names["home"]), _team_key(names["away"]))] = saved_event
+                except requests.RequestException:
+                    continue
         return out
 
     def _espn_fallback_events(self, espn_index: Mapping[tuple[str, str], Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -564,7 +610,11 @@ class FootballModule:
 
     def _fetch_clubelo(self, target: date) -> dict[str, float]:
         try:
-            r = requests.get(f"https://api.clubelo.com/{target.isoformat()}", timeout=10)
+            # ClubElo's published CSV API is served from HTTP, not the HTTPS
+            # endpoint used by the public website.  It is auxiliary only: a
+            # failed rating read must never block fixture, market or snapshot
+            # creation.
+            r = requests.get(f"http://api.clubelo.com/{target.isoformat()}", timeout=10)
             r.raise_for_status()
             rows = r.text.splitlines()
             headings = rows[0].split(",")
@@ -826,7 +876,7 @@ class FootballModule:
                 risk = model.get("risk", {})
                 record = grouped[key] = {
                     "event_id": key, "sport": "football", "kickoff": row["kickoff"],
-                    "home": row["home_team"], "away": row["away_team"], "model": model,
+                    "home": row["home_team"], "away": row["away_team"], "league_key": row["league_key"], "model": model,
                     # Compatibility display values for Core's existing
                     # football_rows_to_shared_report contract.  This pure
                     # helper consumes the already-saved model only.
@@ -1069,6 +1119,11 @@ def _sources_display(summary: Mapping[str, Any]) -> str:
         ("odds_quotes", "The Odds API", "筆盤口"),
     )
     parts = [f"{label} {_number_display(summary[key])}{unit}" for key, label, unit in labels if key in summary]
+    team_statistics = summary.get("team_statistics")
+    if isinstance(team_statistics, Mapping):
+        available = _number_display(team_statistics.get("available", 0))
+        requested = _number_display(team_statistics.get("requested", 0))
+        parts.append(f"球隊統計 {available}/{requested} 隊可用")
     return "｜".join(parts) if parts else "尚未儲存資料來源摘要"
 
 def _team_key(value: Any) -> str:
@@ -1093,8 +1148,16 @@ def _team_key(value: Any) -> str:
     }
     return aliases.get(key, key)
 
+def _taipei_date(value: Any) -> str:
+    """Return the calendar date in Taiwan for every provider timestamp."""
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TZ_UTC)
+    return parsed.astimezone(TZ_TAIPEI).date().isoformat()
+
 def _local_date(value: Any) -> str:
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date().isoformat()
+    """Backward-compatible name; Football's operating date is Taiwan time."""
+    return _taipei_date(value)
 
 def _league_goal_prior(league: str) -> tuple[float, float]:
     return {"eng.1": (1.55,1.25), "esp.1": (1.40,1.10), "ger.1": (1.65,1.35),
@@ -1150,6 +1213,17 @@ def _model_confidence(home: Mapping[str, Any], away: Mapping[str, Any], clubelo:
     score += .15 if confirmed_lineups else 0
     score -= .05 * (len(home.get("fallback_reason", [])) + len(away.get("fallback_reason", [])))
     return round(max(.15, min(.80, score)), 3)
+
+def _has_reliable_team_inputs(model: Mapping[str, Any]) -> bool:
+    """Allow automatic recommendations only when both teams supplied data.
+
+    ClubElo and lineups improve confidence but can legitimately be unavailable
+    close to kickoff.  Missing both teams' season/venue statistics is different:
+    it collapses the forecast to league priors, so publishing an apparent +EV
+    selection would be misleading.
+    """
+    quality = model.get("quality") if isinstance(model, Mapping) else {}
+    return bool(isinstance(quality, Mapping) and quality.get("home_stats") and quality.get("away_stats"))
 
 def _dixon_coles_tau(home: int, away: int, home_lambda: float, away_lambda: float, rho: float) -> float:
     if home == 0 and away == 0: return 1 - home_lambda * away_lambda * rho

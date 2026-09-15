@@ -34,7 +34,10 @@ def check_sources(odds_key, football_key, day):
         ("MLB 官方", "https://statsapi.mlb.com/api/v1/schedule", {"params":{"sportId":1,"date":day}}),
         ("The Odds API", "https://api.the-odds-api.com/v4/sports", {"key":odds_key,"needs_key":True,"params":{"apiKey":odds_key}}),
         ("API-Football", "https://v3.football.api-sports.io/status", {"key":football_key,"needs_key":True,"headers":{"x-apisports-key":football_key}}),
-        ("ClubElo", "https://api.clubelo.com/"+datetime.now(timezone.utc).date().isoformat(), {}),
+        # ClubElo publishes its downloadable ratings CSV on HTTP.  Its public
+        # website is HTTPS, but probing the website endpoint gives a false
+        # negative for the data feed used by FootballModule.
+        ("ClubElo", "http://api.clubelo.com/"+datetime.now(timezone.utc).date().isoformat(), {}),
     ]
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(_check,name,url,**kw) for name,url,kw in jobs]
