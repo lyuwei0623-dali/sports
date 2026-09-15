@@ -849,7 +849,7 @@ class FootballModule:
     def get_published_rows(self, date_str: str) -> list[dict[str, Any]]:
         """Internal SQLite display reader; member routes must use get_member_snapshot."""
         with self._db() as conn:
-            rows = conn.execute("""SELECT e.event_id,e.kickoff,e.home_team,e.away_team,e.model_json,
+            rows = conn.execute("""SELECT e.event_id,e.league_key,e.kickoff,e.home_team,e.away_team,e.model_json,
               r.market_type,r.side,r.line,r.decimal_price,r.model_probability,r.ev,r.playable,r.label
               FROM football_events e LEFT JOIN football_recommendations r
               ON r.date_str=e.date_str AND r.event_id=e.event_id
